@@ -180,30 +180,22 @@ class MultiDimCodeGenerator:
         is_multidim = any(dim > 1 for dim in array_dims.values())
         max_dim = max(array_dims.values()) if array_dims else 1
         
-        # Generate function signature
-        cpp_code = f"""#include <vector>
-#include <cassert>
-#include <cmath>
+        # Generate function signature with raw pointers for easier ctypes integration
+        cpp_code = f"""#include <cmath>
 
 extern "C" {{
 
 void {func_name}("""
         
-        # Add result parameters first (in alphabetical order)
+        # Add result parameters first (raw pointers, in alphabetical order)
         for i, var in enumerate(result_vars):
             if i > 0:
                 cpp_code += ",\n               "
-            
-            if is_multidim and array_dims.get(var, 1) > 1:
-                # Multi-dimensional array as flattened vector with shape parameters
-                cpp_code += f"std::vector<double>& v{var}"
-            else:
-                # 1D array
-                cpp_code += f"std::vector<double>& v{var}"
+            cpp_code += f"double* result_{var}"
         
-        # Add input vector parameters (alphabetically ordered)
+        # Add input vector parameters (raw pointers, alphabetically ordered)
         for var in vector_vars:
-            cpp_code += f",\n               const std::vector<double>& v{var}"
+            cpp_code += f",\n               const double* {var}"
         
         # Add shape parameters for multi-dimensional arrays
         if is_multidim:
@@ -211,51 +203,28 @@ void {func_name}("""
             for dim in range(max_dim):
                 dim_names = ['rows', 'cols', 'depth']
                 if dim < len(dim_names):
-                    shape_params.append(f"const int& {dim_names[dim]}")
+                    shape_params.append(f"const int {dim_names[dim]}")
                 else:
-                    shape_params.append(f"const int& dim{dim}")
+                    shape_params.append(f"const int dim{dim}")
             
             for param in shape_params:
                 cpp_code += f",\n               {param}"
+        else:
+            # Add size parameter for 1D case
+            cpp_code += ",\n               const int n"
         
         # Add scalar parameters (alphabetically ordered) 
         for var in scalar_vars:
-            cpp_code += f",\n               const double& s{var}"
+            cpp_code += f",\n               const double {var}"
             
         cpp_code += ")\n{\n"
-        
-        # Add size assertions and shape calculations
-        if is_multidim:
-            cpp_code += f"    // Multi-dimensional array handling\n"
-            if max_dim >= 2:
-                cpp_code += f"    const int total_size = rows * cols"
-                if max_dim >= 3:
-                    cpp_code += f" * depth"
-                cpp_code += ";\n"
-            
-            # Add assertions for all arrays
-            all_arrays = result_vars + vector_vars
-            for var in all_arrays:
-                if array_dims.get(var, 1) > 1:
-                    cpp_code += f"    assert(v{var}.size() == total_size);\n"
-                else:
-                    cpp_code += f"    assert(v{var}.size() == rows);\n"
-        else:
-            # 1D case (same as v3)
-            all_vectors = result_vars + vector_vars
-            if all_vectors:
-                first_vector = all_vectors[0]
-                cpp_code += f"    const int n = v{first_vector}.size();\n"
-                
-                for var in all_vectors[1:]:
-                    cpp_code += f"    assert(n == v{var}.size());\n"
         
         # Generate stencil bounds
         if is_multidim and max_dim > 1:
             shape_vars = ['rows', 'cols', 'depth'][:max_dim]
             min_bounds, max_bounds = stencil_info.get_loop_bounds(shape_vars)
             
-            cpp_code += f"\n    // Multi-dimensional stencil bounds\n"
+            cpp_code += f"    // Multi-dimensional stencil bounds\n"
             for dim in range(max_dim):
                 dim_names = ['i', 'j', 'k']
                 cpp_code += f"    const int min_{dim_names[dim]} = {min_bounds[dim]};\n"
@@ -289,9 +258,9 @@ void {func_name}("""
                 
                 indent = "    " + "    " * max_dim
                 if array_dims.get(result_var, 1) > 1:
-                    cpp_code += f"{indent}v{result_var}[{index_calc}] = {rhs_str};\n"
+                    cpp_code += f"{indent}result_{result_var}[{index_calc}] = {rhs_str};\n"
                 else:
-                    cpp_code += f"{indent}v{result_var}[i] = {rhs_str};\n"
+                    cpp_code += f"{indent}result_{result_var}[i] = {rhs_str};\n"
             
             # Close nested loops
             for dim in range(max_dim):
@@ -302,7 +271,7 @@ void {func_name}("""
             # 1D case (same as v3)
             if stencil_info.offsets[0] and (stencil_info.min_offsets[0] < 0 or stencil_info.max_offsets[0] > 0):
                 min_bound, max_bound = stencil_info.get_loop_bounds(["n"])
-                cpp_code += f"\n    const int min_index = {min_bound[0]};\n"
+                cpp_code += f"    const int min_index = {min_bound[0]};\n"
                 cpp_code += f"    const int max_index = {max_bound[0]};\n"
                 loop_start = "min_index"
                 loop_end = "max_index"
@@ -320,7 +289,7 @@ void {func_name}("""
                 result_var = str(lhs.base)
                 
                 rhs_str = self._convert_expression_to_cpp(rhs, vector_vars, scalar_vars, result_vars)
-                cpp_code += f"        v{result_var}[i] = {rhs_str};\n"
+                cpp_code += f"        result_{result_var}[i] = {rhs_str};\n"
                 
             cpp_code += "    }\n"
         
@@ -340,24 +309,43 @@ void {func_name}("""
             var_name = match.group(1)
             indices_str = match.group(2)
             
-            if var_name in vector_vars or var_name in result_vars:
-                # Parse indices (could be i, j, k with offsets)
+            if var_name in vector_vars:
+                # Input vector variable
                 indices = [idx.strip() for idx in indices_str.split(',')]
                 
                 if array_dims.get(var_name, 1) > 1:
                     # Multi-dimensional array - convert to flattened index
                     if len(indices) == 2:  # 2D
                         i_expr, j_expr = indices
-                        return f"v{var_name}[({i_expr}) * cols + ({j_expr})]"
+                        return f"{var_name}[({i_expr}) * cols + ({j_expr})]"
                     elif len(indices) == 3:  # 3D
                         i_expr, j_expr, k_expr = indices
-                        return f"v{var_name}[({i_expr}) * cols * depth + ({j_expr}) * depth + ({k_expr})]"
+                        return f"{var_name}[({i_expr}) * cols * depth + ({j_expr}) * depth + ({k_expr})]"
                     else:
                         # Fallback for other dimensions
-                        return f"v{var_name}[{indices[0]}]"
+                        return f"{var_name}[{indices[0]}]"
                 else:
                     # 1D array
-                    return f"v{var_name}[{indices[0]}]"
+                    return f"{var_name}[{indices[0]}]"
+            
+            elif var_name in result_vars:
+                # Result variable (for dependencies between equations)
+                indices = [idx.strip() for idx in indices_str.split(',')]
+                
+                if array_dims.get(var_name, 1) > 1:
+                    # Multi-dimensional array - convert to flattened index
+                    if len(indices) == 2:  # 2D
+                        i_expr, j_expr = indices
+                        return f"result_{var_name}[({i_expr}) * cols + ({j_expr})]"
+                    elif len(indices) == 3:  # 3D
+                        i_expr, j_expr, k_expr = indices
+                        return f"result_{var_name}[({i_expr}) * cols * depth + ({j_expr}) * depth + ({k_expr})]"
+                    else:
+                        # Fallback for other dimensions
+                        return f"result_{var_name}[{indices[0]}]"
+                else:
+                    # 1D array
+                    return f"result_{var_name}[{indices[0]}]"
             
             return match.group(0)
         
@@ -365,16 +353,13 @@ void {func_name}("""
         
         # Replace scalar variables
         for var in scalar_vars:
-            expr_str = re.sub(r'\b' + re.escape(var) + r'\b', f"s{var}", expr_str)
+            expr_str = re.sub(r'\b' + re.escape(var) + r'\b', f"{var}", expr_str)
             
         # Convert power operators - improved pattern to handle complex expressions
         power_pattern = r'(\([^)]+\)|[a-zA-Z_][a-zA-Z0-9_]*\[[^\]]+\]|\w+)\*\*(\d+(?:\.\d+)?|\([^)]+\)|\w+)'
         def power_replacement(match):
             base = match.group(1)
             exponent = match.group(2)
-            # Special case for square root
-            if exponent == "0.5":
-                return f"sqrt({base})"
             return f"pow({base}, {exponent})"
         
         expr_str = re.sub(power_pattern, power_replacement, expr_str)
@@ -382,48 +367,38 @@ void {func_name}("""
         return expr_str
     
     def _convert_expression_to_cpp(self, expr, vector_vars: List[str], scalar_vars: List[str], result_vars: List[str]) -> str:
-        """Convert 1D expression to C++ (same as v3)."""
+        """Convert a SymPy expression to C++ code for 1D case."""
         expr_str = str(expr)
         
+        # Replace indexed expressions with C++ array access
         indexed_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*)\[([^\]]+)\]'
         
         def replace_indexed(match):
             var_name = match.group(1)
             index_expr = match.group(2)
             
-            if var_name in vector_vars or var_name in result_vars:
-                if index_expr == 'i':
-                    return f"v{var_name}[i]"
-                else:
-                    if '+' in index_expr:
-                        parts = index_expr.split('+')
-                        if len(parts) == 2 and parts[0].strip() == 'i':
-                            offset = parts[1].strip()
-                            return f"v{var_name}[i + {offset}]"
-                    elif '-' in index_expr and not index_expr.startswith('-'):
-                        parts = index_expr.split('-')
-                        if len(parts) == 2 and parts[0].strip() == 'i':
-                            offset = parts[1].strip()
-                            return f"v{var_name}[i - {offset}]"
-                    
-                    return f"v{var_name}[{index_expr}]"
+            # Check if this is an input vector variable
+            if var_name in vector_vars:
+                return f"{var_name}[{index_expr}]"
             
-            return match.group(0)
+            # Check if this is a result variable (for dependencies between equations)
+            elif var_name in result_vars:
+                return f"result_{var_name}[{index_expr}]"
+            
+            return match.group(0)  # Return unchanged if not a vector variable
         
         expr_str = re.sub(indexed_pattern, replace_indexed, expr_str)
         
-        # Replace scalar variables
+        # Replace scalar variables with their parameter names
         for var in scalar_vars:
-            expr_str = re.sub(r'\b' + re.escape(var) + r'\b', f"s{var}", expr_str)
+            expr_str = re.sub(r'\b' + re.escape(var) + r'\b', f"{var}", expr_str)
             
-        # Convert power operators - improved pattern to handle complex expressions
-        power_pattern = r'(\([^)]+\)|[a-zA-Z_][a-zA-Z0-9_]*\[[^\]]+\]|\w+)\*\*(\d+(?:\.\d+)?|\([^)]+\)|\w+)'
+        # Convert Python operators to C++ equivalents
+        # Handle power operator ** -> pow()
+        power_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*\[[^\]]+\]|\([^)]+\)|\w+)\*\*(\d+(?:\.\d+)?|\([^)]+\)|\w+)'
         def power_replacement(match):
             base = match.group(1)
             exponent = match.group(2)
-            # Special case for square root
-            if exponent == "0.5":
-                return f"sqrt({base})"
             return f"pow({base}, {exponent})"
         
         expr_str = re.sub(power_pattern, power_replacement, expr_str)
@@ -509,6 +484,7 @@ void {func_name}("""
     def _create_python_wrapper(self, so_file: str, func_name: str, equations: List[sp.Eq]):
         """Create a Python wrapper function for multi-dimensional arrays."""
         import ctypes
+        from ctypes import POINTER, c_double, c_int
         
         # Load the shared library
         lib = ctypes.CDLL(so_file)
@@ -561,10 +537,53 @@ void {func_name}("""
                 scalar_args.append(float(args[arg_idx]))
                 arg_idx += 1
             
-            # Direct computation for v4
-            self._compute_multidim_equations_directly(equations, result_arrays, vector_args, shape_params,
-                                                    scalar_args, vector_vars, scalar_vars, result_vars, 
-                                                    stencil_info, array_dims)
+            # Call the compiled C++ function using ctypes
+            try:
+                # Get the C function
+                c_func = getattr(lib, func_name)
+                
+                # Convert numpy arrays to ctypes pointers
+                result_ptrs = [arr.ctypes.data_as(POINTER(c_double)) for arr in result_arrays]
+                vector_ptrs = [vec.ctypes.data_as(POINTER(c_double)) for vec in vector_args]
+                
+                # Set up argument types for the C function
+                argtypes = []
+                # Result vector pointers
+                for _ in result_arrays:
+                    argtypes.append(POINTER(c_double))
+                # Input vector pointers
+                for _ in vector_args:
+                    argtypes.append(POINTER(c_double))
+                # Shape parameters (if multi-dimensional)
+                if is_multidim:
+                    for _ in range(max_dim):
+                        argtypes.append(c_int)
+                else:
+                    argtypes.append(c_int)  # size parameter for 1D
+                # Scalar arguments
+                for _ in scalar_args:
+                    argtypes.append(c_double)
+                
+                c_func.argtypes = argtypes
+                c_func.restype = None
+                
+                # Call the C++ function
+                if is_multidim:
+                    call_args = result_ptrs + vector_ptrs + shape_params + scalar_args
+                else:
+                    # 1D case - pass array size
+                    n = len(result_arrays[0]) if result_arrays else len(vector_args[0])
+                    call_args = result_ptrs + vector_ptrs + [n] + scalar_args
+                
+                c_func(*call_args)
+                
+            except Exception as e:
+                print(f"Failed to call C++ function: {e}")
+                print("Falling back to Python computation...")
+                # Fallback to Python computation
+                self._compute_multidim_equations_directly(equations, result_arrays, vector_args, shape_params,
+                                                        scalar_args, vector_vars, scalar_vars, result_vars, 
+                                                        stencil_info, array_dims)
             
         return wrapper
     

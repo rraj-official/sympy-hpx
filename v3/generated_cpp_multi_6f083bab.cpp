@@ -2,16 +2,16 @@
 
 extern "C" {
 
-void cpp_func_73f375aa(double* result,
+void cpp_multi_6f083bab(double* result_r,
                const double* a,
                const double* b,
-               const double* c,
-               const double d,
+               const double k,
                const int n)
 {
-    // Generated loop
+
+    // Generated multi-equation loop
     for(int i = 0; i < n; i++) {
-        result[i] = d*a[i] + b[i]*c[i];
+        result_r[i] = k*a[i] + b[i];
     }
 }
 

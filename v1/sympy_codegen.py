@@ -82,45 +82,31 @@ class SymPyCodeGenerator:
         """
         vector_vars, scalar_vars, result_var = self._analyze_expression(eq)
         
-        # Generate function signature
-        cpp_code = f"""#include <vector>
-#include <cassert>
-#include <cmath>
+        # Generate function signature with raw pointers for easier ctypes integration
+        cpp_code = f"""#include <cmath>
 
 extern "C" {{
 
 void {func_name}("""
         
-        # Add result parameter first
-        cpp_code += f"std::vector<double>& v{result_var}"
+        # Add result parameter first (raw pointer)
+        cpp_code += f"double* result"
         
-        # Add vector parameters (alphabetically ordered)
+        # Add vector parameters (raw pointers, alphabetically ordered)
         for var in vector_vars:
             if var != result_var:  # Don't duplicate result variable
-                cpp_code += f",\n               const std::vector<double>& v{var}"
+                cpp_code += f",\n               const double* {var}"
         
         # Add scalar parameters (alphabetically ordered) 
         for var in scalar_vars:
-            cpp_code += f",\n               const double& s{var}"
+            cpp_code += f",\n               const double {var}"
             
+        # Add size parameter
+        cpp_code += ",\n               const int n"
         cpp_code += ")\n{\n"
         
-        # Add size assertions
-        if vector_vars:
-            first_vector = vector_vars[0] if vector_vars[0] != result_var else (vector_vars[1] if len(vector_vars) > 1 else None)
-            if first_vector:
-                cpp_code += f"    const int n = v{first_vector}.size();\n"
-                
-                # Add assertions for all vectors
-                for var in vector_vars:
-                    if var != first_vector:
-                        cpp_code += f"    assert(n == v{var}.size());\n"
-                        
-                if result_var not in vector_vars:
-                    cpp_code += f"    assert(n == v{result_var}.size());\n"
-        
         # Generate the loop body
-        cpp_code += "\n    // Generated loop\n"
+        cpp_code += "    // Generated loop\n"
         cpp_code += "    for(int i = 0; i < n; i++) {\n"
         
         # Convert SymPy expression to C++ code
@@ -128,19 +114,20 @@ void {func_name}("""
         rhs_str = str(rhs)
         
         # Replace indexed variables with C++ array access
-        # First, replace indexed expressions like a[i] with va[i]
+        # First, replace indexed expressions like a[i] with a[i] (already correct for raw pointers)
         for var in vector_vars:
             if var != result_var:  # Don't replace result variable in RHS
-                rhs_str = rhs_str.replace(f"{var}[i]", f"v{var}[i]")
+                # The variable names are already correct for raw pointer access
+                pass
         
-        # Then replace scalar variables with their parameter names
+        # Then replace scalar variables with their parameter names (remove 's' prefix)
         for var in scalar_vars:
-            rhs_str = rhs_str.replace(var, f"s{var}")
+            rhs_str = rhs_str.replace(var, var)  # Keep original name
             
         # Convert Python operators to C++ equivalents
         # Handle power operator ** -> pow()
         import re
-        # Replace patterns like "va[i]**2" with "pow(va[i], 2)"
+        # Replace patterns like "a[i]**2" with "pow(a[i], 2)"
         power_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*\[[^\]]+\]|\([^)]+\)|\w+)\*\*(\d+(?:\.\d+)?|\([^)]+\)|\w+)'
         def power_replacement(match):
             base = match.group(1)
@@ -149,7 +136,7 @@ void {func_name}("""
         
         rhs_str = re.sub(power_pattern, power_replacement, rhs_str)
             
-        cpp_code += f"        v{result_var}[i] = {rhs_str};\n"
+        cpp_code += f"        result[i] = {rhs_str};\n"
         cpp_code += "    }\n"
         cpp_code += "}\n\n}"
         
@@ -193,12 +180,19 @@ void {func_name}("""
         Create a Python wrapper function that calls the compiled C++ function.
         """
         import ctypes
+        from ctypes import POINTER, c_double, c_int
         
         # Load the shared library
         lib = ctypes.CDLL(so_file)
         
         # Get function signature info
         vector_vars, scalar_vars, result_var = self._analyze_expression(eq)
+        
+        # Define ctypes structures for std::vector<double>
+        class StdVector(ctypes.Structure):
+            _fields_ = [("data", POINTER(c_double)),
+                       ("size", c_int),
+                       ("capacity", c_int)]
         
         def wrapper(*args):
             """
@@ -209,8 +203,6 @@ void {func_name}("""
                 expected = 1 + len(vector_vars) - (1 if result_var in vector_vars else 0) + len(scalar_vars)
                 raise ValueError(f"Expected {expected} arguments, got {len(args)}")
             
-            # Convert numpy arrays to ctypes
-            c_vectors = []
             arg_idx = 0
             
             # Result vector (first argument)
@@ -231,25 +223,42 @@ void {func_name}("""
                 scalar_args.append(float(args[arg_idx]))
                 arg_idx += 1
             
-            # Set up ctypes function signature
-            lib_func = getattr(lib, func_name)
-            
-            # Call the C++ function
-            # Note: This is a simplified version. In a full implementation,
-            # you'd need to properly set up ctypes argument and return types
-            # For now, we'll use a direct approach with numpy arrays
-            
-            # Get the size
+            # Get the size and verify all vectors have the same size
             n = len(result_array)
-            
-            # Verify all vectors have the same size
             for vec in vector_args:
                 if len(vec) != n:
                     raise ValueError("All vectors must have the same size")
             
-            # Simple direct computation (bypassing ctypes for this example)
-            # In a full implementation, you'd call the compiled C++ function
-            self._compute_directly(eq, result_array, vector_args, scalar_args, vector_vars, scalar_vars, result_var)
+            # Call the compiled C++ function using a simpler approach
+            # Since we're using extern "C" and basic types, we can call directly
+            try:
+                # Get the C function
+                c_func = getattr(lib, func_name)
+                
+                # Convert numpy arrays to ctypes pointers
+                result_ptr = result_array.ctypes.data_as(POINTER(c_double))
+                vector_ptrs = [vec.ctypes.data_as(POINTER(c_double)) for vec in vector_args]
+                
+                # Set up argument types for the C function
+                argtypes = [POINTER(c_double)]  # result vector
+                for _ in vector_args:
+                    argtypes.append(POINTER(c_double))  # input vectors
+                for _ in scalar_args:
+                    argtypes.append(c_double)  # scalar arguments
+                argtypes.append(c_int)  # size parameter
+                
+                c_func.argtypes = argtypes
+                c_func.restype = None
+                
+                # Call the C++ function
+                call_args = [result_ptr] + vector_ptrs + scalar_args + [n]
+                c_func(*call_args)
+                
+            except Exception as e:
+                print(f"Failed to call C++ function: {e}")
+                print("Falling back to Python computation...")
+                # Fallback to Python computation
+                self._compute_directly(eq, result_array, vector_args, scalar_args, vector_vars, scalar_vars, result_var)
             
         return wrapper
     

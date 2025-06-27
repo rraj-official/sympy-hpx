@@ -158,45 +158,35 @@ class MultiEquationCodeGenerator:
         """
         vector_vars, scalar_vars, result_vars, stencil_info = self._analyze_equations(equations)
         
-        # Generate function signature
-        cpp_code = f"""#include <vector>
-#include <cassert>
-#include <cmath>
+        # Generate function signature with raw pointers for easier ctypes integration
+        cpp_code = f"""#include <cmath>
 
 extern "C" {{
 
 void {func_name}("""
         
-        # Add result parameters first (in alphabetical order)
+        # Add result parameters first (raw pointers, in alphabetical order)
         for i, var in enumerate(result_vars):
             if i > 0:
                 cpp_code += ",\n               "
-            cpp_code += f"std::vector<double>& v{var}"
+            cpp_code += f"double* result_{var}"
         
-        # Add input vector parameters (alphabetically ordered)
+        # Add input vector parameters (raw pointers, alphabetically ordered)
         for var in vector_vars:
-            cpp_code += f",\n               const std::vector<double>& v{var}"
+            cpp_code += f",\n               const double* {var}"
         
         # Add scalar parameters (alphabetically ordered) 
         for var in scalar_vars:
-            cpp_code += f",\n               const double& s{var}"
+            cpp_code += f",\n               const double {var}"
             
+        # Add size parameter
+        cpp_code += ",\n               const int n"
         cpp_code += ")\n{\n"
-        
-        # Add size assertions
-        all_vectors = result_vars + vector_vars
-        if all_vectors:
-            first_vector = all_vectors[0]
-            cpp_code += f"    const int n = v{first_vector}.size();\n"
-            
-            # Add assertions for all vectors
-            for var in all_vectors[1:]:
-                cpp_code += f"    assert(n == v{var}.size());\n"
         
         # Generate stencil bounds
         if stencil_info.offsets and (stencil_info.min_offset < 0 or stencil_info.max_offset > 0):
             min_bound, max_bound = stencil_info.get_loop_bounds("n")
-            cpp_code += f"\n    const int min_index = {min_bound}; // from stencil pattern\n"
+            cpp_code += f"    const int min_index = {min_bound}; // from stencil pattern\n"
             cpp_code += f"    const int max_index = {max_bound}; // from stencil pattern\n"
             loop_start = "min_index"
             loop_end = "max_index"
@@ -205,18 +195,20 @@ void {func_name}("""
             loop_end = "n"
         
         # Generate the loop body
-        cpp_code += "\n    // Generated multi-equation loop\n"
+        cpp_code += f"\n    // Generated multi-equation loop\n"
         cpp_code += f"    for(int i = {loop_start}; i < {loop_end}; i++) {{\n"
         
-        # Convert each equation to C++ code
+        # Process each equation
         for eq in equations:
             lhs = eq.lhs
             rhs = eq.rhs
             result_var = str(lhs.base)
             
+            # Convert SymPy expression to C++ code
             rhs_str = self._convert_expression_to_cpp(rhs, vector_vars, scalar_vars, result_vars)
-            cpp_code += f"        v{result_var}[i] = {rhs_str};\n"
             
+            cpp_code += f"        result_{result_var}[i] = {rhs_str};\n"
+        
         cpp_code += "    }\n"
         cpp_code += "}\n\n}"
         
@@ -224,23 +216,22 @@ void {func_name}("""
     
     def _convert_expression_to_cpp(self, expr, vector_vars: List[str], scalar_vars: List[str], result_vars: List[str]) -> str:
         """
-        Convert a SymPy expression to C++ code, handling stencil patterns and multiple vectors.
+        Convert a SymPy expression to C++ code string.
         """
         expr_str = str(expr)
         
-        # Handle stencil patterns - replace indexed expressions with offsets
-        # Pattern: variable[i+offset] or variable[i-offset] or variable[i]
+        # Replace indexed expressions with C++ array access
         indexed_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*)\[([^\]]+)\]'
         
         def replace_indexed(match):
             var_name = match.group(1)
             index_expr = match.group(2)
             
-            # Check if this is a vector variable (input or result)
-            if var_name in vector_vars or var_name in result_vars:
+            # Check if this is an input vector variable
+            if var_name in vector_vars:
                 # Parse the index expression
                 if index_expr == 'i':
-                    return f"v{var_name}[i]"
+                    return f"{var_name}[i]"
                 else:
                     # Handle expressions like i+1, i-2
                     # Simple parsing for common patterns
@@ -248,15 +239,36 @@ void {func_name}("""
                         parts = index_expr.split('+')
                         if len(parts) == 2 and parts[0].strip() == 'i':
                             offset = parts[1].strip()
-                            return f"v{var_name}[i + {offset}]"
+                            return f"{var_name}[i + {offset}]"
                     elif '-' in index_expr and not index_expr.startswith('-'):
                         parts = index_expr.split('-')
                         if len(parts) == 2 and parts[0].strip() == 'i':
                             offset = parts[1].strip()
-                            return f"v{var_name}[i - {offset}]"
+                            return f"{var_name}[i - {offset}]"
                     
                     # Fallback: use the expression as-is
-                    return f"v{var_name}[{index_expr}]"
+                    return f"{var_name}[{index_expr}]"
+            
+            # Check if this is a result variable (for dependencies between equations)
+            elif var_name in result_vars:
+                # Parse the index expression
+                if index_expr == 'i':
+                    return f"result_{var_name}[i]"
+                else:
+                    # Handle expressions like i+1, i-2
+                    if '+' in index_expr:
+                        parts = index_expr.split('+')
+                        if len(parts) == 2 and parts[0].strip() == 'i':
+                            offset = parts[1].strip()
+                            return f"result_{var_name}[i + {offset}]"
+                    elif '-' in index_expr and not index_expr.startswith('-'):
+                        parts = index_expr.split('-')
+                        if len(parts) == 2 and parts[0].strip() == 'i':
+                            offset = parts[1].strip()
+                            return f"result_{var_name}[i - {offset}]"
+                    
+                    # Fallback: use the expression as-is
+                    return f"result_{var_name}[{index_expr}]"
             
             return match.group(0)  # Return unchanged if not a vector variable
         
@@ -264,7 +276,7 @@ void {func_name}("""
         
         # Replace scalar variables with their parameter names
         for var in scalar_vars:
-            expr_str = re.sub(r'\b' + re.escape(var) + r'\b', f"s{var}", expr_str)
+            expr_str = re.sub(r'\b' + re.escape(var) + r'\b', f"{var}", expr_str)
             
         # Convert Python operators to C++ equivalents
         # Handle power operator ** -> pow()
@@ -316,6 +328,7 @@ void {func_name}("""
         Create a Python wrapper function that calls the compiled C++ function.
         """
         import ctypes
+        from ctypes import POINTER, c_double, c_int
         
         # Load the shared library
         lib = ctypes.CDLL(so_file)
@@ -371,9 +384,42 @@ void {func_name}("""
                 if min_index >= max_index:
                     raise ValueError(f"Invalid stencil bounds: min_index={min_index}, max_index={max_index}, array_size={n}")
             
-            # Direct computation for v3
-            self._compute_multi_equations_directly(equations, result_arrays, vector_args, scalar_args, 
-                                                 vector_vars, scalar_vars, result_vars, stencil_info)
+            # Call the compiled C++ function using ctypes
+            try:
+                # Get the C function
+                c_func = getattr(lib, func_name)
+                
+                # Convert numpy arrays to ctypes pointers
+                result_ptrs = [arr.ctypes.data_as(POINTER(c_double)) for arr in result_arrays]
+                vector_ptrs = [vec.ctypes.data_as(POINTER(c_double)) for vec in vector_args]
+                
+                # Set up argument types for the C function
+                argtypes = []
+                # Result vector pointers
+                for _ in result_arrays:
+                    argtypes.append(POINTER(c_double))
+                # Input vector pointers
+                for _ in vector_args:
+                    argtypes.append(POINTER(c_double))
+                # Scalar arguments
+                for _ in scalar_args:
+                    argtypes.append(c_double)
+                # Size parameter
+                argtypes.append(c_int)
+                
+                c_func.argtypes = argtypes
+                c_func.restype = None
+                
+                # Call the C++ function
+                call_args = result_ptrs + vector_ptrs + scalar_args + [n]
+                c_func(*call_args)
+                
+            except Exception as e:
+                print(f"Failed to call C++ function: {e}")
+                print("Falling back to Python computation...")
+                # Fallback to Python computation
+                self._compute_multi_equations_directly(equations, result_arrays, vector_args, scalar_args, 
+                                                     vector_vars, scalar_vars, result_vars, stencil_info)
             
         return wrapper
     

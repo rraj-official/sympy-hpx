@@ -149,47 +149,33 @@ class SymPyStencilCodeGenerator:
         """
         vector_vars, scalar_vars, result_var, stencil_info = self._analyze_expression(eq)
         
-        # Generate function signature
-        cpp_code = f"""#include <vector>
-#include <cassert>
-#include <cmath>
+        # Generate function signature with raw pointers for easier ctypes integration
+        cpp_code = f"""#include <cmath>
 
 extern "C" {{
 
 void {func_name}("""
         
-        # Add result parameter first
-        cpp_code += f"std::vector<double>& v{result_var}"
+        # Add result parameter first (raw pointer)
+        cpp_code += f"double* result"
         
-        # Add vector parameters (alphabetically ordered)
+        # Add vector parameters (raw pointers, alphabetically ordered)
         for var in vector_vars:
             if var != result_var:  # Don't duplicate result variable
-                cpp_code += f",\n               const std::vector<double>& v{var}"
+                cpp_code += f",\n               const double* {var}"
         
         # Add scalar parameters (alphabetically ordered) 
         for var in scalar_vars:
-            cpp_code += f",\n               const double& s{var}"
+            cpp_code += f",\n               const double {var}"
             
+        # Add size parameter
+        cpp_code += ",\n               const int n"
         cpp_code += ")\n{\n"
-        
-        # Add size assertions
-        if vector_vars:
-            first_vector = vector_vars[0] if vector_vars[0] != result_var else (vector_vars[1] if len(vector_vars) > 1 else None)
-            if first_vector:
-                cpp_code += f"    const int n = v{first_vector}.size();\n"
-                
-                # Add assertions for all vectors
-                for var in vector_vars:
-                    if var != first_vector:
-                        cpp_code += f"    assert(n == v{var}.size());\n"
-                        
-                if result_var not in vector_vars:
-                    cpp_code += f"    assert(n == v{result_var}.size());\n"
         
         # Generate stencil bounds
         if stencil_info.offsets and (stencil_info.min_offset < 0 or stencil_info.max_offset > 0):
             min_bound, max_bound = stencil_info.get_loop_bounds("n")
-            cpp_code += f"\n    const int min_index = {min_bound}; // from stencil pattern\n"
+            cpp_code += f"    const int min_index = {min_bound}; // from stencil pattern\n"
             cpp_code += f"    const int max_index = {max_bound}; // from stencil pattern\n"
             loop_start = "min_index"
             loop_end = "max_index"
@@ -198,14 +184,14 @@ void {func_name}("""
             loop_end = "n"
         
         # Generate the loop body
-        cpp_code += "\n    // Generated stencil loop\n"
+        cpp_code += f"\n    // Generated stencil loop\n"
         cpp_code += f"    for(int i = {loop_start}; i < {loop_end}; i++) {{\n"
         
         # Convert SymPy expression to C++ code
         rhs = eq.rhs
         rhs_str = self._convert_expression_to_cpp(rhs, vector_vars, scalar_vars, result_var)
             
-        cpp_code += f"        v{result_var}[i] = {rhs_str};\n"
+        cpp_code += f"        result[i] = {rhs_str};\n"
         cpp_code += "    }\n"
         cpp_code += "}\n\n}"
         
@@ -228,7 +214,7 @@ void {func_name}("""
             if var_name in vector_vars and var_name != result_var:
                 # Parse the index expression
                 if index_expr == 'i':
-                    return f"v{var_name}[i]"
+                    return f"{var_name}[i]"
                 else:
                     # Handle expressions like i+1, i-2
                     # Simple parsing for common patterns
@@ -236,15 +222,15 @@ void {func_name}("""
                         parts = index_expr.split('+')
                         if len(parts) == 2 and parts[0].strip() == 'i':
                             offset = parts[1].strip()
-                            return f"v{var_name}[i + {offset}]"
+                            return f"{var_name}[i + {offset}]"
                     elif '-' in index_expr and not index_expr.startswith('-'):
                         parts = index_expr.split('-')
                         if len(parts) == 2 and parts[0].strip() == 'i':
                             offset = parts[1].strip()
-                            return f"v{var_name}[i - {offset}]"
+                            return f"{var_name}[i - {offset}]"
                     
                     # Fallback: use the expression as-is (might need more complex parsing)
-                    return f"v{var_name}[{index_expr}]"
+                    return f"{var_name}[{index_expr}]"
             
             return match.group(0)  # Return unchanged if not a vector variable
         
@@ -252,7 +238,7 @@ void {func_name}("""
         
         # Replace scalar variables with their parameter names
         for var in scalar_vars:
-            expr_str = re.sub(r'\b' + re.escape(var) + r'\b', f"s{var}", expr_str)
+            expr_str = re.sub(r'\b' + re.escape(var) + r'\b', f"{var}", expr_str)
             
         # Convert Python operators to C++ equivalents
         # Handle power operator ** -> pow()
@@ -304,6 +290,7 @@ void {func_name}("""
         Create a Python wrapper function that calls the compiled C++ function.
         """
         import ctypes
+        from ctypes import POINTER, c_double, c_int
         
         # Load the shared library
         lib = ctypes.CDLL(so_file)
@@ -356,9 +343,36 @@ void {func_name}("""
                 if min_index >= max_index:
                     raise ValueError(f"Invalid stencil bounds: min_index={min_index}, max_index={max_index}, array_size={n}")
             
-            # Direct computation (for v2, we'll improve this to use actual ctypes calls)
-            self._compute_stencil_directly(eq, result_array, vector_args, scalar_args, 
-                                         vector_vars, scalar_vars, result_var, stencil_info)
+            # Call the compiled C++ function using ctypes
+            try:
+                # Get the C function
+                c_func = getattr(lib, func_name)
+                
+                # Convert numpy arrays to ctypes pointers
+                result_ptr = result_array.ctypes.data_as(POINTER(c_double))
+                vector_ptrs = [vec.ctypes.data_as(POINTER(c_double)) for vec in vector_args]
+                
+                # Set up argument types for the C function
+                argtypes = [POINTER(c_double)]  # result vector
+                for _ in vector_args:
+                    argtypes.append(POINTER(c_double))  # input vectors
+                for _ in scalar_args:
+                    argtypes.append(c_double)  # scalar arguments
+                argtypes.append(c_int)  # size parameter
+                
+                c_func.argtypes = argtypes
+                c_func.restype = None
+                
+                # Call the C++ function
+                call_args = [result_ptr] + vector_ptrs + scalar_args + [n]
+                c_func(*call_args)
+                
+            except Exception as e:
+                print(f"Failed to call C++ function: {e}")
+                print("Falling back to Python computation...")
+                # Fallback to Python computation
+                self._compute_stencil_directly(eq, result_array, vector_args, scalar_args, 
+                                             vector_vars, scalar_vars, result_var, stencil_info)
             
         return wrapper
     
