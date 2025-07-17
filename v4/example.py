@@ -149,8 +149,9 @@ b_vals = np.array([0.1, 0.2, 0.3, 0.4, 0.5])
 r_vals = np.zeros(size)
 k_val = 2.0
 
-# Call 1D function (no shape parameters needed)
-func_1d(r_vals, a_vals, b_vals, k_val)
+# Call 1D function
+# For v4, 1D functions expect the size parameter *last*
+func_1d(r_vals, a_vals, b_vals, k_val, size)
 
 print(f"   Input a: {a_vals}")
 print(f"   Input b: {b_vals}")

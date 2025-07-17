@@ -34,8 +34,8 @@ def test_1d_backward_compatibility():
     vr = np.zeros(size)
     k_val = 3.0
     
-    # Call function
-    func(vr, va, vb, k_val)
+    # Call function (include size parameter for 1D)
+    func(vr, va, vb, k_val, size)
     
     # Verify results
     expected = k_val * va + vb

@@ -418,14 +418,68 @@ void {func_name}("""
         return expr_str
     
     def _fix_power_operators(self, expr_str: str) -> str:
-        """Fix power operators in expressions."""
-        power_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*\[[^\]]+\]|\([^)]+\)|\w+)\*\*(\d+(?:\.\d+)?|\([^)]+\)|\w+)'
-        def power_replacement(match):
-            base = match.group(1)
-            exponent = match.group(2)
-            return f"pow({base}, {exponent})"
+        """
+        Replace Python-style '**' power operators with C++ functions (pow, sqrt).
+        This function iteratively finds and replaces power operations, starting from
+        the rightmost (which corresponds to the innermost in evaluation order)
+        to handle complex nested expressions correctly.
+        """
+        while "**" in expr_str:
+            idx = expr_str.rfind("**")
+
+            # ---- Find Exponent ----
+            exponent_part = expr_str[idx+2:].lstrip()
+            exponent_str = ""
+            # Exponent can be a number like 2, 0.5, or a parenthesized expression
+            if exponent_part.startswith('('):
+                level = 1
+                for i in range(1, len(exponent_part)):
+                    if exponent_part[i] == '(': level += 1
+                    elif exponent_part[i] == ')': level -= 1
+                    if level == 0:
+                        exponent_str = exponent_part[:i+1]
+                        break
+            else:
+                match = re.match(r"[0-9.]+|[a-zA-Z_]\w*", exponent_part)
+                if match:
+                    exponent_str = match.group(0)
+
+            if not exponent_str: break 
+
+            # ---- Find Base ----
+            base_part = expr_str[:idx].rstrip()
+            base_str = ""
+            if base_part.endswith(')'):
+                level = 1
+                start_idx = -1
+                for i in range(len(base_part)-2, -1, -1):
+                    if base_part[i] == ')': level += 1
+                    elif base_part[i] == '(': level -= 1
+                    if level == 0:
+                        start_idx = i
+                        break
+                if start_idx != -1:
+                    base_str = base_part[start_idx:]
+            else:
+                match = re.search(r"([a-zA-Z_]\w*(?:\[[^\]]+\])?)$", base_part)
+                if match:
+                    base_str = match.group(1)
+
+            if not base_str: break
+
+            # ---- Construct Replacement ----
+            replacement = ""
+            if exponent_str in ["0.5", "(1/2)"]:
+                 replacement = f"sqrt({base_str})"
+            else:
+                 replacement = f"pow({base_str}, {exponent_str})"
+
+            # ---- Replace in Original String ----
+            start_replace_idx = expr_str.rfind(base_str, 0, idx)
+            end_replace_idx = idx + 2 + len(expr_str[idx+2:]) - len(exponent_part) + len(exponent_str)
+            expr_str = expr_str[:start_replace_idx] + replacement + expr_str[end_replace_idx:]
         
-        return re.sub(power_pattern, power_replacement, expr_str)
+        return expr_str
     
     def _compile_cpp_code(self, cpp_code: str, func_name: str) -> str:
         """Compile the C++ code into a shared library and return the path."""
@@ -540,11 +594,11 @@ void {func_name}("""
                 if is_multidim:
                     for _ in range(max_dim):
                         argtypes.append(c_int)
-                else:
-                    argtypes.append(c_int)  # size parameter for 1D
                 # Scalar arguments
                 for _ in scalar_args:
                     argtypes.append(c_double)
+                if not is_multidim:
+                    argtypes.append(c_int)  # size parameter for 1D
                 
                 c_func.argtypes = argtypes
                 c_func.restype = None
@@ -553,9 +607,9 @@ void {func_name}("""
                 if is_multidim:
                     call_args = result_ptrs + vector_ptrs + shape_params + scalar_args
                 else:
-                    # 1D case - pass array size
+                    # 1D case - pass array size *last*
                     n = len(result_arrays[0]) if result_arrays else len(vector_args[0])
-                    call_args = result_ptrs + vector_ptrs + [n] + scalar_args
+                    call_args = result_ptrs + vector_ptrs + scalar_args + [n]
                 
                 c_func(*call_args)
                 
