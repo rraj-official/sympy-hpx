@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# C/C++ extensions
+*.so
+*.o
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Virtual environment
+venv/
+.venv/
+
+# Generated files
+generated_*.cpp
+generated_*.so
+file_count.txt
+
+# IDE / Editor specific
+.vscode/
+.idea/
+.project
+.pydevproject
+.spyderproject
+.spyderworkspace
+
+# OS-specific
+.DS_Store
+Thumbs.db 

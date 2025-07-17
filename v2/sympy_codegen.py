@@ -1,36 +1,68 @@
 """
-SymPy-based code generation for HPX Python API v2 - Stencil Operations
-Generates C++ functions from SymPy expressions with support for stencil patterns (offset indices).
+SymPy-based code generation for HPX Python API v2 - Stencil Support
+Extends v1 with support for stencil operations and offset indices.
 """
 
 import os
 import subprocess
-import tempfile
 import hashlib
-from typing import Dict, List, Tuple, Any, Set
+import atexit
+import re
+from typing import Dict, List, Tuple, Any
 import sympy as sp
 import numpy as np
-import re
+
+
+# Global set to track generated files for cleanup
+_generated_files = set()
+
+
+def _cleanup_generated_files():
+    """Cleanup function to remove generated files on exit."""
+    for file_path in _generated_files.copy():
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                _generated_files.discard(file_path)
+        except OSError:
+            pass  # File might already be deleted
+
+
+# Register cleanup function to run on exit
+atexit.register(_cleanup_generated_files)
 
 
 class StencilInfo:
-    """Information about stencil patterns in an expression."""
+    """
+    Stores information about stencil patterns in the equation.
+    """
     def __init__(self):
+        self.offsets = set()
         self.min_offset = 0
         self.max_offset = 0
-        self.offsets = set()
-    
+        
     def add_offset(self, offset: int):
-        """Add an index offset to the stencil pattern."""
+        """Add an offset to the stencil pattern."""
         self.offsets.add(offset)
         self.min_offset = min(self.min_offset, offset)
         self.max_offset = max(self.max_offset, offset)
-    
-    def get_loop_bounds(self, n: str) -> Tuple[str, str]:
-        """Get the loop bounds for safe stencil access."""
-        min_index = max(0, -self.min_offset)
-        max_index = f"{n} - {self.max_offset}" if self.max_offset > 0 else n
-        return str(min_index), max_index
+        
+    def get_loop_bounds(self, size_var: str) -> Tuple[str, str]:
+        """
+        Get the loop bounds for the stencil pattern.
+        Returns (min_bound, max_bound) as strings.
+        """
+        if self.min_offset < 0:
+            min_bound = f"({-self.min_offset})"
+        else:
+            min_bound = "0"
+            
+        if self.max_offset > 0:
+            max_bound = f"({size_var} - {self.max_offset})"
+        else:
+            max_bound = size_var
+            
+        return min_bound, max_bound
 
 
 class SymPyStencilCodeGenerator:
@@ -39,7 +71,6 @@ class SymPyStencilCodeGenerator:
     """
     
     def __init__(self):
-        self.temp_dir = tempfile.mkdtemp()
         self.compiled_functions = {}
         
     def _analyze_expression(self, eq: sp.Eq) -> Tuple[List[str], List[str], str, StencilInfo]:
@@ -83,7 +114,7 @@ class SymPyStencilCodeGenerator:
                 if isinstance(idx, (sp.Symbol, sp.Idx)):
                     index_vars.add(str(idx))
                 elif hasattr(idx, 'free_symbols'):
-                    # Handle expressions like i+1, i-2
+                    # Handle compound expressions like i+1, i-2
                     for sym in idx.free_symbols:
                         if isinstance(sym, (sp.Symbol, sp.Idx)):
                             index_vars.add(str(sym))
@@ -117,8 +148,8 @@ class SymPyStencilCodeGenerator:
         Parse an index expression to extract the offset.
         Examples: i -> 0, i+1 -> 1, i-2 -> -2
         """
-        if isinstance(idx_expr, (sp.Symbol, sp.Idx)):
-            return 0
+        if isinstance(idx_expr, sp.Symbol):
+            return 0  # Simple index like 'i'
         elif isinstance(idx_expr, sp.Add):
             # Handle expressions like i+1, i-2
             offset = 0
@@ -126,22 +157,16 @@ class SymPyStencilCodeGenerator:
                 if isinstance(arg, sp.Integer):
                     offset += int(arg)
                 elif isinstance(arg, sp.Mul) and len(arg.args) == 2:
-                    # Handle expressions like -2 (which is Mul(-1, 2))
-                    if isinstance(arg.args[0], sp.Integer) and isinstance(arg.args[1], sp.Integer):
-                        offset += int(arg.args[0]) * int(arg.args[1])
+                    # Handle negative offsets like -2
+                    if isinstance(arg.args[0], sp.Integer) and arg.args[0] == -1:
+                        if isinstance(arg.args[1], sp.Integer):
+                            offset -= int(arg.args[1])
             return offset
         elif isinstance(idx_expr, sp.Integer):
             return int(idx_expr)
         else:
-            # For complex expressions, try to evaluate numerically
-            try:
-                # Replace any symbols with 0 to get the constant offset
-                simplified = idx_expr
-                for sym in idx_expr.free_symbols:
-                    simplified = simplified.subs(sym, 0)
-                return int(simplified)
-            except:
-                return 0
+            # For more complex expressions, default to 0
+            return 0
     
     def _generate_cpp_code(self, eq: sp.Eq, func_name: str) -> str:
         """
@@ -190,49 +215,32 @@ void {func_name}("""
         # Convert SymPy expression to C++ code
         rhs = eq.rhs
         rhs_str = self._convert_expression_to_cpp(rhs, vector_vars, scalar_vars, result_var)
-            
+        
         cpp_code += f"        result[i] = {rhs_str};\n"
         cpp_code += "    }\n"
         cpp_code += "}\n\n}"
         
         return cpp_code
     
-    def _convert_expression_to_cpp(self, expr, vector_vars: List[str], scalar_vars: List[str], result_var: str) -> str:
+    def _convert_expression_to_cpp(self, expr, vector_vars, scalar_vars, result_var) -> str:
         """
-        Convert a SymPy expression to C++ code, handling stencil patterns.
+        Convert a SymPy expression to C++ code string.
         """
         expr_str = str(expr)
         
-        # Handle stencil patterns - replace indexed expressions with offsets
-        # Pattern: variable[i+offset] or variable[i-offset] or variable[i]
-        indexed_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*)\[([^\]]+)\]'
+        # Handle indexed expressions with stencil patterns
+        # Pattern to match indexed expressions like a[i], b[i+1], c[i-2]
+        indexed_pattern = r'(\w+)\[([^\]]+)\]'
         
         def replace_indexed(match):
             var_name = match.group(1)
             index_expr = match.group(2)
             
-            if var_name in vector_vars and var_name != result_var:
-                # Parse the index expression
-                if index_expr == 'i':
-                    return f"{var_name}[i]"
-                else:
-                    # Handle expressions like i+1, i-2
-                    # Simple parsing for common patterns
-                    if '+' in index_expr:
-                        parts = index_expr.split('+')
-                        if len(parts) == 2 and parts[0].strip() == 'i':
-                            offset = parts[1].strip()
-                            return f"{var_name}[i + {offset}]"
-                    elif '-' in index_expr and not index_expr.startswith('-'):
-                        parts = index_expr.split('-')
-                        if len(parts) == 2 and parts[0].strip() == 'i':
-                            offset = parts[1].strip()
-                            return f"{var_name}[i - {offset}]"
-                    
-                    # Fallback: use the expression as-is (might need more complex parsing)
-                    return f"{var_name}[{index_expr}]"
+            # Convert index expression to C++ syntax
+            # Handle cases like i+1, i-2, etc.
+            cpp_index = index_expr.replace(" ", "")
             
-            return match.group(0)  # Return unchanged if not a vector variable
+            return f"{var_name}[{cpp_index}]"
         
         expr_str = re.sub(indexed_pattern, replace_indexed, expr_str)
         
@@ -258,19 +266,18 @@ void {func_name}("""
         """
         # Create unique filename based on code hash
         code_hash = hashlib.md5(cpp_code.encode()).hexdigest()[:8]
-        cpp_file = os.path.join(self.temp_dir, f"{func_name}_{code_hash}.cpp")
-        so_file = os.path.join(self.temp_dir, f"{func_name}_{code_hash}.so")
+        cpp_file = f"generated_{func_name}_{code_hash}.cpp"
+        so_file = f"generated_{func_name}_{code_hash}.so"
         
-        # Also save to current directory for inspection
-        local_cpp_file = f"generated_{func_name}.cpp"
-        
-        # Write C++ code to both temp and local files
+        # Write C++ code to local file
         with open(cpp_file, 'w') as f:
             f.write(cpp_code)
-        with open(local_cpp_file, 'w') as f:
-            f.write(cpp_code)
             
-        print(f"Generated C++ code saved to: {local_cpp_file}")
+        print(f"Generated C++ code saved to: {cpp_file}")
+        
+        # Track files for cleanup
+        _generated_files.add(cpp_file)
+        _generated_files.add(so_file)
             
         # Compile to shared library
         compile_cmd = [
@@ -279,8 +286,12 @@ void {func_name}("""
         ]
         
         try:
-            subprocess.run(compile_cmd, check=True, capture_output=True, text=True)
+            result = subprocess.run(compile_cmd, check=True, capture_output=True, text=True)
+            print(f"Compilation successful for: {so_file}")
         except subprocess.CalledProcessError as e:
+            print(f"Compilation command: {' '.join(compile_cmd)}")
+            print(f"Compilation stderr: {e.stderr}")
+            print(f"Compilation stdout: {e.stdout}")
             raise RuntimeError(f"Compilation failed: {e.stderr}")
             
         return so_file
@@ -292,8 +303,9 @@ void {func_name}("""
         import ctypes
         from ctypes import POINTER, c_double, c_int
         
-        # Load the shared library
-        lib = ctypes.CDLL(so_file)
+        # Load the shared library (use absolute path)
+        abs_so_file = os.path.abspath(so_file)
+        lib = ctypes.CDLL(abs_so_file)
         
         # Get function signature info
         vector_vars, scalar_vars, result_var, stencil_info = self._analyze_expression(eq)
@@ -379,21 +391,21 @@ void {func_name}("""
     def _compute_stencil_directly(self, eq: sp.Eq, result_array, vector_args, scalar_args, 
                                 vector_vars, scalar_vars, result_var, stencil_info):
         """
-        Direct computation of stencil operations.
+        Direct computation of the stencil equation using SymPy evaluation.
         """
         n = len(result_array)
         
         # Create symbol mapping
         symbol_map = {}
         
-        # Map vector variables
-        vec_idx = 0
+        # Map vector variables to their arrays
+        vector_idx = 0
         for var in vector_vars:
             if var != result_var:
-                symbol_map[var] = vector_args[vec_idx]
-                vec_idx += 1
+                symbol_map[var] = vector_args[vector_idx]
+                vector_idx += 1
         
-        # Map scalar variables
+        # Map scalar variables to their values
         for i, var in enumerate(scalar_vars):
             symbol_map[var] = scalar_args[i]
         
@@ -405,15 +417,14 @@ void {func_name}("""
             min_index = 0
             max_index = n
         
-        # Evaluate the expression for each valid index
-        rhs = eq.rhs
-        
+        # Evaluate the equation for each valid index
         for i in range(min_index, max_index):
             try:
-                # Substitute variables in the expression
-                expr_subs = rhs
+                # Get the right-hand side of the equation
+                rhs = eq.rhs
                 
-                # Handle indexed expressions with stencil patterns
+                # Substitute indexed expressions with stencil patterns
+                expr_subs = rhs
                 indexed_exprs = list(rhs.atoms(sp.Indexed))
                 for indexed_expr in indexed_exprs:
                     base_name = str(indexed_expr.base)
@@ -435,9 +446,8 @@ void {func_name}("""
                 
                 # Evaluate the result
                 result_array[i] = float(expr_subs.evalf())
-                
-            except Exception as e:
-                # Fallback for complex expressions
+            except Exception:
+                # If evaluation fails, set to 0.0
                 result_array[i] = 0.0
 
 

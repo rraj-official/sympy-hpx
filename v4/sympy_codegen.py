@@ -1,47 +1,57 @@
 """
 SymPy-based code generation for HPX Python API v4 - Multi-Dimensional Support
-Extends v3 multi-equation processing with support for 2D and 3D arrays and stencils.
+Extends v3 with support for multi-dimensional arrays and advanced optimizations.
 """
 
 import os
 import subprocess
-import tempfile
 import hashlib
-from typing import Dict, List, Tuple, Any, Set, Union
+import atexit
+import re
+from typing import Dict, List, Tuple, Any, Union
 import sympy as sp
 import numpy as np
-import re
+
+
+# Global set to track generated files for cleanup
+_generated_files = set()
+
+
+def _cleanup_generated_files():
+    """Cleanup function to remove generated files on exit."""
+    for file_path in _generated_files.copy():
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                _generated_files.discard(file_path)
+        except OSError:
+            pass  # File might already be deleted
+
+
+# Register cleanup function to run on exit
+atexit.register(_cleanup_generated_files)
 
 
 class MultiDimStencilInfo:
-    """Information about multi-dimensional stencil patterns."""
-    def __init__(self, dimensions: int = 1):
-        self.dimensions = dimensions
-        self.offsets = {dim: set() for dim in range(dimensions)}
-        self.min_offsets = {dim: 0 for dim in range(dimensions)}
-        self.max_offsets = {dim: 0 for dim in range(dimensions)}
+    """Enhanced stencil info for multi-dimensional arrays."""
+    def __init__(self, max_dimensions: int = 3):
+        self.max_dimensions = max_dimensions
+        self.offsets = {dim: set() for dim in range(max_dimensions)}
+        self.min_offset = {dim: 0 for dim in range(max_dimensions)}
+        self.max_offset = {dim: 0 for dim in range(max_dimensions)}
     
     def add_offset(self, dim: int, offset: int):
-        """Add an index offset for a specific dimension."""
-        if dim >= self.dimensions:
-            raise ValueError(f"Dimension {dim} exceeds array dimensions {self.dimensions}")
-        
-        self.offsets[dim].add(offset)
-        self.min_offsets[dim] = min(self.min_offsets[dim], offset)
-        self.max_offsets[dim] = max(self.max_offsets[dim], offset)
+        """Add an offset for a specific dimension."""
+        if dim < self.max_dimensions:
+            self.offsets[dim].add(offset)
+            self.min_offset[dim] = min(self.min_offset[dim], offset)
+            self.max_offset[dim] = max(self.max_offset[dim], offset)
     
-    def get_loop_bounds(self, shape_vars: List[str]) -> Tuple[List[str], List[str]]:
-        """Get the loop bounds for safe multi-dimensional stencil access."""
-        min_indices = []
-        max_indices = []
-        
-        for dim in range(self.dimensions):
-            min_idx = max(0, -self.min_offsets[dim])
-            max_idx = f"{shape_vars[dim]} - {self.max_offsets[dim]}" if self.max_offsets[dim] > 0 else shape_vars[dim]
-            min_indices.append(str(min_idx))
-            max_indices.append(max_idx)
-        
-        return min_indices, max_indices
+    def get_loop_bounds(self, dim: int, size_var: str) -> Tuple[str, str]:
+        """Get loop bounds for a specific dimension."""
+        min_bound = f"({-self.min_offset[dim]})" if self.min_offset[dim] < 0 else "0"
+        max_bound = f"({size_var} - {self.max_offset[dim]})" if self.max_offset[dim] > 0 else size_var
+        return min_bound, max_bound
 
 
 class MultiDimCodeGenerator:
@@ -50,7 +60,6 @@ class MultiDimCodeGenerator:
     """
     
     def __init__(self):
-        self.temp_dir = tempfile.mkdtemp()
         self.compiled_functions = {}
         
     def _analyze_equations(self, equations: List[sp.Eq]) -> Tuple[List[str], List[str], List[str], MultiDimStencilInfo, Dict[str, int]]:
@@ -93,7 +102,7 @@ class MultiDimCodeGenerator:
         
         stencil_info = MultiDimStencilInfo(max_dimensions)
         
-        # Second pass: analyze variables and stencil patterns
+        # Second pass: analyze each equation
         for eq in equations:
             lhs = eq.lhs
             rhs = eq.rhs
@@ -102,54 +111,40 @@ class MultiDimCodeGenerator:
             if isinstance(lhs, sp.Indexed):
                 result_var = str(lhs.base)
                 result_vars.append(result_var)
-                all_vector_vars.add(result_var)
             else:
                 raise ValueError("Left-hand side must be an indexed expression")
             
-            # Find all IndexedBase objects
+            # Find all IndexedBase objects in this equation
             indexed_bases = list(eq.atoms(sp.IndexedBase))
-            for base in indexed_bases:
-                all_vector_vars.add(str(base))
+            equation_vectors = [str(base) for base in indexed_bases]
+            all_vector_vars.update(equation_vectors)
             
             # Analyze multi-dimensional stencil patterns
             indexed_exprs = list(eq.atoms(sp.Indexed))
             for indexed in indexed_exprs:
-                for dim, idx_expr in enumerate(indexed.indices):
-                    offset = self._parse_index_offset(idx_expr)
-                    stencil_info.add_offset(dim, offset)
+                for dim_idx, idx_expr in enumerate(indexed.indices):
+                    if dim_idx < max_dimensions:
+                        offset = self._parse_index_offset(idx_expr)
+                        stencil_info.add_offset(dim_idx, offset)
             
-            # Find scalar variables
+            # Find scalar variables in this equation
             all_symbols = list(eq.atoms(sp.Symbol))
             for symbol in all_symbols:
                 symbol_name = str(symbol)
-                
-                # Skip if this symbol corresponds to an IndexedBase
-                if symbol_name in all_vector_vars:
-                    continue
-                    
-                # Skip if this is an index variable
-                if symbol_name in index_vars:
-                    continue
-                
-                # Add to scalar variables
-                all_scalar_vars.add(symbol_name)
-        
-        # Separate input arrays from result arrays
-        input_vector_vars = []
-        for var in sorted(all_vector_vars):
-            if var not in result_vars:
-                input_vector_vars.append(var)
+                if symbol_name not in equation_vectors and symbol_name not in index_vars:
+                    all_scalar_vars.add(symbol_name)
         
         # Convert to sorted lists
-        vector_vars = sorted(input_vector_vars)
+        vector_vars = sorted(list(all_vector_vars))
         scalar_vars = sorted(list(all_scalar_vars))
-        # Preserve original order of result variables (don't sort)
-        result_vars = list(dict.fromkeys(result_vars))  # Remove duplicates while preserving order
         
-        return vector_vars, scalar_vars, result_vars, stencil_info, array_dims
+        # Remove result variables from input vectors
+        input_vector_vars = [var for var in vector_vars if var not in result_vars]
+        
+        return input_vector_vars, scalar_vars, result_vars, stencil_info, array_dims
     
     def _parse_index_offset(self, idx_expr) -> int:
-        """Parse an index expression to extract the offset (same as v3)."""
+        """Parse index expression to extract offset."""
         if isinstance(idx_expr, (sp.Symbol, sp.Idx)):
             return 0
         elif isinstance(idx_expr, sp.Add):
@@ -164,13 +159,7 @@ class MultiDimCodeGenerator:
         elif isinstance(idx_expr, sp.Integer):
             return int(idx_expr)
         else:
-            try:
-                simplified = idx_expr
-                for sym in idx_expr.free_symbols:
-                    simplified = simplified.subs(sym, 0)
-                return int(simplified)
-            except:
-                return 0
+            return 0
     
     def _generate_cpp_code(self, equations: List[sp.Eq], func_name: str) -> str:
         """Generate C++ code for multi-dimensional equations."""
@@ -180,293 +169,279 @@ class MultiDimCodeGenerator:
         is_multidim = any(dim > 1 for dim in array_dims.values())
         max_dim = max(array_dims.values()) if array_dims else 1
         
-        # Generate function signature with raw pointers for easier ctypes integration
+        # Generate function signature
         cpp_code = f"""#include <cmath>
 
 extern "C" {{
 
 void {func_name}("""
         
-        # Add result parameters first (raw pointers, in alphabetical order)
+        # Result parameters first
         for i, var in enumerate(result_vars):
             if i > 0:
                 cpp_code += ",\n               "
             cpp_code += f"double* result_{var}"
         
-        # Add input vector parameters (raw pointers, alphabetically ordered)
+        # Input vector parameters
         for var in vector_vars:
             cpp_code += f",\n               const double* {var}"
         
-        # Add shape parameters for multi-dimensional arrays
+        # Dimension parameters (if multi-dimensional)
         if is_multidim:
-            shape_params = []
-            for dim in range(max_dim):
-                dim_names = ['rows', 'cols', 'depth']
-                if dim < len(dim_names):
-                    shape_params.append(f"const int {dim_names[dim]}")
-                else:
-                    shape_params.append(f"const int dim{dim}")
-            
-            for param in shape_params:
-                cpp_code += f",\n               {param}"
+            if max_dim >= 2:
+                cpp_code += ",\n               const int rows"
+                cpp_code += ",\n               const int cols"
+            if max_dim >= 3:
+                cpp_code += ",\n               const int depth"
         else:
-            # Add size parameter for 1D case
             cpp_code += ",\n               const int n"
         
-        # Add scalar parameters (alphabetically ordered) 
+        # Scalar parameters
         for var in scalar_vars:
             cpp_code += f",\n               const double {var}"
-            
+        
         cpp_code += ")\n{\n"
         
-        # Generate stencil bounds
+        # Generate loop structure based on dimensionality
         if is_multidim and max_dim > 1:
-            shape_vars = ['rows', 'cols', 'depth'][:max_dim]
-            min_bounds, max_bounds = stencil_info.get_loop_bounds(shape_vars)
-            
-            cpp_code += f"    // Multi-dimensional stencil bounds\n"
-            for dim in range(max_dim):
-                dim_names = ['i', 'j', 'k']
-                cpp_code += f"    const int min_{dim_names[dim]} = {min_bounds[dim]};\n"
-                cpp_code += f"    const int max_{dim_names[dim]} = {max_bounds[dim]};\n"
-            
-            # Generate nested loops
-            cpp_code += f"\n    // Generated multi-dimensional loop\n"
-            for dim in range(max_dim):
-                dim_names = ['i', 'j', 'k']
-                indent = "    " + "    " * dim
-                cpp_code += f"{indent}for(int {dim_names[dim]} = min_{dim_names[dim]}; {dim_names[dim]} < max_{dim_names[dim]}; {dim_names[dim]}++) {{\n"
-            
-            # Generate index calculation for flattened arrays
-            if max_dim == 2:
-                index_calc = "i * cols + j"
-            elif max_dim == 3:
-                index_calc = "i * cols * depth + j * depth + k"
-            else:
-                index_calc = "i"  # fallback
-            
-            # Convert each equation to C++ code
-            for eq in equations:
-                lhs = eq.lhs
-                rhs = eq.rhs
-                result_var = str(lhs.base)
-                
-                rhs_str = self._convert_multidim_expression_to_cpp(rhs, vector_vars, scalar_vars, result_vars, array_dims, max_dim)
-                
-                # Post-process to fix any remaining **0.5 patterns
-                rhs_str = self._fix_power_operators(rhs_str)
-                
-                indent = "    " + "    " * max_dim
-                if array_dims.get(result_var, 1) > 1:
-                    cpp_code += f"{indent}result_{result_var}[{index_calc}] = {rhs_str};\n"
-                else:
-                    cpp_code += f"{indent}result_{result_var}[i] = {rhs_str};\n"
-            
-            # Close nested loops
-            for dim in range(max_dim):
-                indent = "    " + "    " * (max_dim - 1 - dim)
-                cpp_code += f"{indent}}}\n"
-                
+            cpp_code += self._generate_multidim_loops(equations, vector_vars, scalar_vars, result_vars, 
+                                                    stencil_info, array_dims, max_dim)
         else:
-            # 1D case (same as v3)
-            if stencil_info.offsets[0] and (stencil_info.min_offsets[0] < 0 or stencil_info.max_offsets[0] > 0):
-                min_bound, max_bound = stencil_info.get_loop_bounds(["n"])
-                cpp_code += f"    const int min_index = {min_bound[0]};\n"
-                cpp_code += f"    const int max_index = {max_bound[0]};\n"
-                loop_start = "min_index"
-                loop_end = "max_index"
-            else:
-                loop_start = "0"
-                loop_end = "n"
-            
-            cpp_code += "\n    // Generated multi-equation loop\n"
-            cpp_code += f"    for(int i = {loop_start}; i < {loop_end}; i++) {{\n"
-            
-            # Convert each equation to C++ code
-            for eq in equations:
-                lhs = eq.lhs
-                rhs = eq.rhs
-                result_var = str(lhs.base)
-                
-                rhs_str = self._convert_expression_to_cpp(rhs, vector_vars, scalar_vars, result_vars)
-                cpp_code += f"        result_{result_var}[i] = {rhs_str};\n"
-                
-            cpp_code += "    }\n"
+            cpp_code += self._generate_1d_loops(equations, vector_vars, scalar_vars, result_vars, stencil_info)
         
         cpp_code += "}\n\n}"
         
         return cpp_code
     
-    def _convert_multidim_expression_to_cpp(self, expr, vector_vars: List[str], scalar_vars: List[str], 
-                                          result_vars: List[str], array_dims: Dict[str, int], max_dim: int) -> str:
-        """Convert a SymPy expression to C++ code with multi-dimensional support."""
-        expr_str = str(expr)
+    def _generate_1d_loops(self, equations: List[sp.Eq], vector_vars: List[str], scalar_vars: List[str],
+                          result_vars: List[str], stencil_info: MultiDimStencilInfo) -> str:
+        """Generate 1D loop structure."""
+        cpp_code = ""
         
-        # Handle multi-dimensional indexed expressions
-        indexed_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*)\[([^\]]+)\]'
+        # Generate stencil bounds for 1D
+        if stencil_info.offsets[0] and (stencil_info.min_offset[0] < 0 or stencil_info.max_offset[0] > 0):
+            min_bound, max_bound = stencil_info.get_loop_bounds(0, "n")
+            cpp_code += f"    const int min_index = {min_bound};\n"
+            cpp_code += f"    const int max_index = {max_bound};\n"
+            loop_start = "min_index"
+            loop_end = "max_index"
+        else:
+            loop_start = "0"
+            loop_end = "n"
         
-        def replace_multidim_indexed(match):
-            var_name = match.group(1)
-            indices_str = match.group(2)
+        cpp_code += f"\n    // Generated 1D loop\n"
+        cpp_code += f"    for(int i = {loop_start}; i < {loop_end}; i++) {{\n"
+        
+        # Process each equation
+        for eq in equations:
+            lhs = eq.lhs
+            rhs = eq.rhs
+            result_var = str(lhs.base)
             
-            if var_name in vector_vars:
-                # Input vector variable
-                indices = [idx.strip() for idx in indices_str.split(',')]
-                
-                if array_dims.get(var_name, 1) > 1:
-                    # Multi-dimensional array - convert to flattened index
-                    if len(indices) == 2:  # 2D
-                        i_expr, j_expr = indices
-                        return f"{var_name}[({i_expr}) * cols + ({j_expr})]"
-                    elif len(indices) == 3:  # 3D
-                        i_expr, j_expr, k_expr = indices
-                        return f"{var_name}[({i_expr}) * cols * depth + ({j_expr}) * depth + ({k_expr})]"
-                    else:
-                        # Fallback for other dimensions
-                        return f"{var_name}[{indices[0]}]"
-                else:
-                    # 1D array
-                    return f"{var_name}[{indices[0]}]"
+            # Convert expression to C++ code
+            rhs_str = self._convert_1d_expression_to_cpp(rhs, vector_vars, scalar_vars, result_vars)
             
-            elif var_name in result_vars:
-                # Result variable (for dependencies between equations)
-                indices = [idx.strip() for idx in indices_str.split(',')]
-                
-                if array_dims.get(var_name, 1) > 1:
-                    # Multi-dimensional array - convert to flattened index
-                    if len(indices) == 2:  # 2D
-                        i_expr, j_expr = indices
-                        return f"result_{var_name}[({i_expr}) * cols + ({j_expr})]"
-                    elif len(indices) == 3:  # 3D
-                        i_expr, j_expr, k_expr = indices
-                        return f"result_{var_name}[({i_expr}) * cols * depth + ({j_expr}) * depth + ({k_expr})]"
-                    else:
-                        # Fallback for other dimensions
-                        return f"result_{var_name}[{indices[0]}]"
-                else:
-                    # 1D array
-                    return f"result_{var_name}[{indices[0]}]"
-            
-            return match.group(0)
+            cpp_code += f"        result_{result_var}[i] = {rhs_str};\n"
         
-        expr_str = re.sub(indexed_pattern, replace_multidim_indexed, expr_str)
+        cpp_code += "    }\n"
         
-        # Replace scalar variables
-        for var in scalar_vars:
-            expr_str = re.sub(r'\b' + re.escape(var) + r'\b', f"{var}", expr_str)
-            
-        # Convert power operators - improved pattern to handle complex expressions
-        power_pattern = r'(\([^)]+\)|[a-zA-Z_][a-zA-Z0-9_]*\[[^\]]+\]|\w+)\*\*(\d+(?:\.\d+)?|\([^)]+\)|\w+)'
-        def power_replacement(match):
-            base = match.group(1)
-            exponent = match.group(2)
-            return f"pow({base}, {exponent})"
-        
-        expr_str = re.sub(power_pattern, power_replacement, expr_str)
-        
-        return expr_str
+        return cpp_code
     
-    def _convert_expression_to_cpp(self, expr, vector_vars: List[str], scalar_vars: List[str], result_vars: List[str]) -> str:
-        """Convert a SymPy expression to C++ code for 1D case."""
+    def _generate_multidim_loops(self, equations: List[sp.Eq], vector_vars: List[str], scalar_vars: List[str],
+                               result_vars: List[str], stencil_info: MultiDimStencilInfo, 
+                               array_dims: Dict[str, int], max_dim: int) -> str:
+        """Generate multi-dimensional loop structure."""
+        cpp_code = ""
+        
+        if max_dim == 2:
+            # 2D nested loops
+            cpp_code += "    // Generated 2D loops\n"
+            cpp_code += "    for(int i = 0; i < rows; i++) {\n"
+            cpp_code += "        for(int j = 0; j < cols; j++) {\n"
+            
+            # Process each equation
+            for eq in equations:
+                lhs = eq.lhs
+                rhs = eq.rhs
+                result_var = str(lhs.base)
+                
+                # Convert expression to C++ code
+                rhs_str = self._convert_2d_expression_to_cpp(rhs, vector_vars, scalar_vars, result_vars, array_dims)
+                
+                cpp_code += f"            result_{result_var}[i * cols + j] = {rhs_str};\n"
+            
+            cpp_code += "        }\n"
+            cpp_code += "    }\n"
+            
+        elif max_dim == 3:
+            # 3D nested loops
+            cpp_code += "    // Generated 3D loops\n"
+            cpp_code += "    for(int i = 0; i < rows; i++) {\n"
+            cpp_code += "        for(int j = 0; j < cols; j++) {\n"
+            cpp_code += "            for(int k = 0; k < depth; k++) {\n"
+            
+            # Process each equation
+            for eq in equations:
+                lhs = eq.lhs
+                rhs = eq.rhs
+                result_var = str(lhs.base)
+                
+                # Convert expression to C++ code
+                rhs_str = self._convert_3d_expression_to_cpp(rhs, vector_vars, scalar_vars, result_vars, array_dims)
+                
+                cpp_code += f"                result_{result_var}[i * cols * depth + j * depth + k] = {rhs_str};\n"
+            
+            cpp_code += "            }\n"
+            cpp_code += "        }\n"
+            cpp_code += "    }\n"
+        
+        return cpp_code
+    
+    def _convert_1d_expression_to_cpp(self, expr, vector_vars: List[str], scalar_vars: List[str], result_vars: List[str]) -> str:
+        """Convert 1D expression to C++ code."""
         expr_str = str(expr)
         
-        # Replace indexed expressions with C++ array access
+        # Handle indexed expressions
         indexed_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*)\[([^\]]+)\]'
         
         def replace_indexed(match):
             var_name = match.group(1)
             index_expr = match.group(2)
             
-            # Check if this is an input vector variable
             if var_name in vector_vars:
                 return f"{var_name}[{index_expr}]"
-            
-            # Check if this is a result variable (for dependencies between equations)
             elif var_name in result_vars:
                 return f"result_{var_name}[{index_expr}]"
-            
-            return match.group(0)  # Return unchanged if not a vector variable
+            else:
+                return match.group(0)
         
         expr_str = re.sub(indexed_pattern, replace_indexed, expr_str)
         
-        # Replace scalar variables with their parameter names
+        # Replace scalar variables
         for var in scalar_vars:
-            expr_str = re.sub(r'\b' + re.escape(var) + r'\b', f"{var}", expr_str)
+            expr_str = re.sub(r'\b' + re.escape(var) + r'\b', var, expr_str)
+        
+        # Handle power operators
+        expr_str = self._fix_power_operators(expr_str)
+        
+        return expr_str
+    
+    def _convert_2d_expression_to_cpp(self, expr, vector_vars: List[str], scalar_vars: List[str], 
+                                    result_vars: List[str], array_dims: Dict[str, int]) -> str:
+        """Convert 2D expression to C++ code."""
+        expr_str = str(expr)
+        
+        # Handle indexed expressions
+        indexed_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*)\[([^\]]+)\]'
+        
+        def replace_indexed(match):
+            var_name = match.group(1)
+            index_expr = match.group(2)
             
-        # Convert Python operators to C++ equivalents
-        # Handle power operator ** -> pow()
+            if var_name in vector_vars or var_name in result_vars:
+                # Parse multi-dimensional indices
+                indices = [idx.strip() for idx in index_expr.split(',')]
+                if len(indices) == 2:
+                    # 2D access
+                    flat_access = f"({indices[0]}) * cols + ({indices[1]})"
+                    if var_name in vector_vars:
+                        return f"{var_name}[{flat_access}]"
+                    elif var_name in result_vars:
+                        return f"result_{var_name}[{flat_access}]"
+                else:
+                    # 1D access
+                    if var_name in vector_vars:
+                        return f"{var_name}[{index_expr}]"
+                    elif var_name in result_vars:
+                        return f"result_{var_name}[{index_expr}]"
+            
+            return match.group(0)
+        
+        expr_str = re.sub(indexed_pattern, replace_indexed, expr_str)
+        
+        # Replace scalar variables
+        for var in scalar_vars:
+            expr_str = re.sub(r'\b' + re.escape(var) + r'\b', var, expr_str)
+        
+        # Handle power operators
+        expr_str = self._fix_power_operators(expr_str)
+        
+        return expr_str
+    
+    def _convert_3d_expression_to_cpp(self, expr, vector_vars: List[str], scalar_vars: List[str], 
+                                    result_vars: List[str], array_dims: Dict[str, int]) -> str:
+        """Convert 3D expression to C++ code."""
+        expr_str = str(expr)
+        
+        # Handle indexed expressions
+        indexed_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*)\[([^\]]+)\]'
+        
+        def replace_indexed(match):
+            var_name = match.group(1)
+            index_expr = match.group(2)
+            
+            if var_name in vector_vars or var_name in result_vars:
+                # Parse multi-dimensional indices
+                indices = [idx.strip() for idx in index_expr.split(',')]
+                if len(indices) == 3:
+                    # 3D access
+                    flat_access = f"({indices[0]}) * cols * depth + ({indices[1]}) * depth + ({indices[2]})"
+                    if var_name in vector_vars:
+                        return f"{var_name}[{flat_access}]"
+                    elif var_name in result_vars:
+                        return f"result_{var_name}[{flat_access}]"
+                elif len(indices) == 2:
+                    # 2D access
+                    flat_access = f"({indices[0]}) * cols + ({indices[1]})"
+                    if var_name in vector_vars:
+                        return f"{var_name}[{flat_access}]"
+                    elif var_name in result_vars:
+                        return f"result_{var_name}[{flat_access}]"
+                else:
+                    # 1D access
+                    if var_name in vector_vars:
+                        return f"{var_name}[{index_expr}]"
+                    elif var_name in result_vars:
+                        return f"result_{var_name}[{index_expr}]"
+            
+            return match.group(0)
+        
+        expr_str = re.sub(indexed_pattern, replace_indexed, expr_str)
+        
+        # Replace scalar variables
+        for var in scalar_vars:
+            expr_str = re.sub(r'\b' + re.escape(var) + r'\b', var, expr_str)
+        
+        # Handle power operators
+        expr_str = self._fix_power_operators(expr_str)
+        
+        return expr_str
+    
+    def _fix_power_operators(self, expr_str: str) -> str:
+        """Fix power operators in expressions."""
         power_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*\[[^\]]+\]|\([^)]+\)|\w+)\*\*(\d+(?:\.\d+)?|\([^)]+\)|\w+)'
         def power_replacement(match):
             base = match.group(1)
             exponent = match.group(2)
             return f"pow({base}, {exponent})"
         
-        expr_str = re.sub(power_pattern, power_replacement, expr_str)
-        
-        return expr_str
-    
-    def _fix_power_operators(self, expr_str: str) -> str:
-        """Fix any remaining **0.5 patterns that weren't caught by the main conversion."""
-        # Multiple passes to handle nested cases
-        prev_expr = ""
-        while prev_expr != expr_str:
-            prev_expr = expr_str
-            
-            # Handle complex expressions with balanced parentheses
-            # Look for patterns like (...)**0.5 where ... can contain nested parentheses
-            paren_count = 0
-            i = 0
-            while i < len(expr_str):
-                if expr_str[i] == '(':
-                    start = i
-                    paren_count = 1
-                    i += 1
-                    
-                    # Find matching closing parenthesis
-                    while i < len(expr_str) and paren_count > 0:
-                        if expr_str[i] == '(':
-                            paren_count += 1
-                        elif expr_str[i] == ')':
-                            paren_count -= 1
-                        i += 1
-                    
-                    # Check if followed by **0.5
-                    if i < len(expr_str) - 4 and expr_str[i:i+5] == '**0.5':
-                        # Replace this pattern
-                        inner_expr = expr_str[start+1:i-1]  # content between parentheses
-                        replacement = f'sqrt({inner_expr})'
-                        expr_str = expr_str[:start] + replacement + expr_str[i+5:]
-                        break  # Restart the loop
-                else:
-                    i += 1
-        
-        # Handle simple cases that might have been missed
-        # Array access patterns like var[index]**0.5
-        array_sqrt_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*\[[^\]]+\])\*\*0\.5'
-        expr_str = re.sub(array_sqrt_pattern, r'sqrt(\1)', expr_str)
-        
-        # Simple variable patterns like var**0.5
-        var_sqrt_pattern = r'\b([a-zA-Z_][a-zA-Z0-9_]*)\*\*0\.5'
-        expr_str = re.sub(var_sqrt_pattern, r'sqrt(\1)', expr_str)
-        
-        return expr_str
+        return re.sub(power_pattern, power_replacement, expr_str)
     
     def _compile_cpp_code(self, cpp_code: str, func_name: str) -> str:
         """Compile the C++ code into a shared library and return the path."""
         code_hash = hashlib.md5(cpp_code.encode()).hexdigest()[:8]
-        cpp_file = os.path.join(self.temp_dir, f"{func_name}_{code_hash}.cpp")
-        so_file = os.path.join(self.temp_dir, f"{func_name}_{code_hash}.so")
+        cpp_file = f"generated_{func_name}_{code_hash}.cpp"
+        so_file = f"generated_{func_name}_{code_hash}.so"
         
-        # Also save to current directory for inspection
-        local_cpp_file = f"generated_{func_name}.cpp"
-        
-        # Write C++ code to both temp and local files
+        # Write C++ code to local file
         with open(cpp_file, 'w') as f:
             f.write(cpp_code)
-        with open(local_cpp_file, 'w') as f:
-            f.write(cpp_code)
             
-        print(f"Generated C++ code saved to: {local_cpp_file}")
+        print(f"Generated C++ code saved to: {cpp_file}")
+        
+        # Track files for cleanup
+        _generated_files.add(cpp_file)
+        _generated_files.add(so_file)
             
         # Compile to shared library
         compile_cmd = [
@@ -475,8 +450,12 @@ void {func_name}("""
         ]
         
         try:
-            subprocess.run(compile_cmd, check=True, capture_output=True, text=True)
+            result = subprocess.run(compile_cmd, check=True, capture_output=True, text=True)
+            print(f"Compilation successful for: {so_file}")
         except subprocess.CalledProcessError as e:
+            print(f"Compilation command: {' '.join(compile_cmd)}")
+            print(f"Compilation stderr: {e.stderr}")
+            print(f"Compilation stdout: {e.stdout}")
             raise RuntimeError(f"Compilation failed: {e.stderr}")
             
         return so_file
@@ -486,8 +465,9 @@ void {func_name}("""
         import ctypes
         from ctypes import POINTER, c_double, c_int
         
-        # Load the shared library
-        lib = ctypes.CDLL(so_file)
+        # Load the shared library (use absolute path)
+        abs_so_file = os.path.abspath(so_file)
+        lib = ctypes.CDLL(abs_so_file)
         
         # Get function signature info
         vector_vars, scalar_vars, result_vars, stencil_info, array_dims = self._analyze_equations(equations)
@@ -504,6 +484,8 @@ void {func_name}("""
             expected_args = len(result_vars) + len(vector_vars) + len(scalar_vars)
             if is_multidim:
                 expected_args += max_dim  # shape parameters
+            else:
+                expected_args += 1  # size parameter for 1D
             
             if len(args) != expected_args:
                 raise ValueError(f"Expected {expected_args} arguments, got {len(args)}")
@@ -623,144 +605,20 @@ void {func_name}("""
             # 1D case (same as v3)
             self._compute_1d_equations(equations, symbol_map, result_vars, stencil_info)
     
-    def _compute_2d_equations(self, equations, symbol_map, result_vars, stencil_info, array_dims, rows, cols):
-        """Compute 2D equations."""
-        min_bounds, max_bounds = stencil_info.get_loop_bounds(['rows', 'cols'])
-        min_i, min_j = int(min_bounds[0]), int(min_bounds[1])
-        max_i = rows - stencil_info.max_offsets[0] if stencil_info.max_offsets[0] > 0 else rows
-        max_j = cols - stencil_info.max_offsets[1] if stencil_info.max_offsets[1] > 0 else cols
-        
-        for i in range(min_i, max_i):
-            for j in range(min_j, max_j):
-                flat_idx = i * cols + j
-                
-                for eq in equations:
-                    try:
-                        lhs = eq.lhs
-                        rhs = eq.rhs
-                        result_var = str(lhs.base)
-                        
-                        # Substitute indexed expressions
-                        expr_subs = rhs
-                        indexed_exprs = list(rhs.atoms(sp.Indexed))
-                        
-                        for indexed_expr in indexed_exprs:
-                            base_name = str(indexed_expr.base)
-                            if base_name in symbol_map and isinstance(symbol_map[base_name], np.ndarray):
-                                indices = indexed_expr.indices
-                                
-                                # Handle different dimensionalities
-                                if len(indices) == 2:
-                                    # 2D array access
-                                    i_offset = self._parse_index_offset(indices[0])
-                                    j_offset = self._parse_index_offset(indices[1])
-                                    
-                                    access_i = i + i_offset
-                                    access_j = j + j_offset
-                                    
-                                    if (0 <= access_i < rows and 0 <= access_j < cols):
-                                        if array_dims.get(base_name, 1) > 1:
-                                            # 2D array - use flattened index
-                                            access_idx = access_i * cols + access_j
-                                        else:
-                                            # 1D array - use only first dimension
-                                            access_idx = access_i
-                                        
-                                        if 0 <= access_idx < len(symbol_map[base_name]):
-                                            value = symbol_map[base_name][access_idx]
-                                            expr_subs = expr_subs.subs(indexed_expr, value)
-                                
-                                elif len(indices) == 1:
-                                    # 1D array access
-                                    i_offset = self._parse_index_offset(indices[0])
-                                    access_i = i + i_offset
-                                    
-                                    if 0 <= access_i < len(symbol_map[base_name]):
-                                        value = symbol_map[base_name][access_i]
-                                        expr_subs = expr_subs.subs(indexed_expr, value)
-                        
-                        # Substitute scalars
-                        for var, value in symbol_map.items():
-                            if not isinstance(value, np.ndarray):
-                                expr_subs = expr_subs.subs(sp.Symbol(var), value)
-                        
-                        # Store result
-                        if array_dims.get(result_var, 1) > 1:
-                            symbol_map[result_var][flat_idx] = float(expr_subs.evalf())
-                        else:
-                            symbol_map[result_var][i] = float(expr_subs.evalf())
-                            
-                    except Exception as e:
-                        if array_dims.get(result_var, 1) > 1:
-                            symbol_map[result_var][flat_idx] = 0.0
-                        else:
-                            symbol_map[result_var][i] = 0.0
-    
-    def _compute_3d_equations(self, equations, symbol_map, result_vars, stencil_info, array_dims, rows, cols, depth):
-        """Compute 3D equations."""
-        min_bounds, max_bounds = stencil_info.get_loop_bounds(['rows', 'cols', 'depth'])
-        min_i, min_j, min_k = int(min_bounds[0]), int(min_bounds[1]), int(min_bounds[2])
-        max_i = rows - stencil_info.max_offsets[0] if stencil_info.max_offsets[0] > 0 else rows
-        max_j = cols - stencil_info.max_offsets[1] if stencil_info.max_offsets[1] > 0 else cols
-        max_k = depth - stencil_info.max_offsets[2] if stencil_info.max_offsets[2] > 0 else depth
-        
-        for i in range(min_i, max_i):
-            for j in range(min_j, max_j):
-                for k in range(min_k, max_k):
-                    flat_idx = i * cols * depth + j * depth + k
-                    
-                    for eq in equations:
-                        try:
-                            lhs = eq.lhs
-                            rhs = eq.rhs
-                            result_var = str(lhs.base)
-                            
-                            # Similar to 2D but with 3 indices
-                            expr_subs = rhs
-                            indexed_exprs = list(rhs.atoms(sp.Indexed))
-                            
-                            for indexed_expr in indexed_exprs:
-                                base_name = str(indexed_expr.base)
-                                if base_name in symbol_map and isinstance(symbol_map[base_name], np.ndarray):
-                                    indices = indexed_expr.indices
-                                    if len(indices) == 3:
-                                        i_offset = self._parse_index_offset(indices[0])
-                                        j_offset = self._parse_index_offset(indices[1])
-                                        k_offset = self._parse_index_offset(indices[2])
-                                        
-                                        access_i = i + i_offset
-                                        access_j = j + j_offset
-                                        access_k = k + k_offset
-                                        
-                                        if (0 <= access_i < rows and 0 <= access_j < cols and 0 <= access_k < depth):
-                                            access_idx = access_i * cols * depth + access_j * depth + access_k
-                                            value = symbol_map[base_name][access_idx]
-                                            expr_subs = expr_subs.subs(indexed_expr, value)
-                            
-                            # Substitute scalars
-                            for var, value in symbol_map.items():
-                                if not isinstance(value, np.ndarray):
-                                    expr_subs = expr_subs.subs(sp.Symbol(var), value)
-                            
-                            # Store result
-                            symbol_map[result_var][flat_idx] = float(expr_subs.evalf())
-                            
-                        except Exception as e:
-                            symbol_map[result_var][flat_idx] = 0.0
-    
-    def _compute_1d_equations(self, equations, symbol_map, result_vars, stencil_info):
-        """Compute 1D equations (same as v3)."""
-        n = len(list(symbol_map.values())[0])  # Get size from first array
+    def _compute_1d_equations(self, equations: List[sp.Eq], symbol_map: Dict[str, Any], 
+                            result_vars: List[str], stencil_info: MultiDimStencilInfo):
+        """Compute 1D equations directly."""
+        n = len(symbol_map[result_vars[0]])
         
         # Determine loop bounds
-        if stencil_info.offsets[0] and (stencil_info.min_offsets[0] < 0 or stencil_info.max_offsets[0] > 0):
-            min_index = max(0, -stencil_info.min_offsets[0])
-            max_index = n - stencil_info.max_offsets[0] if stencil_info.max_offsets[0] > 0 else n
+        if stencil_info.offsets[0] and (stencil_info.min_offset[0] < 0 or stencil_info.max_offset[0] > 0):
+            min_index = max(0, -stencil_info.min_offset[0])
+            max_index = n - stencil_info.max_offset[0] if stencil_info.max_offset[0] > 0 else n
         else:
             min_index = 0
             max_index = n
         
-        # Evaluate each equation for each valid index
+        # Evaluate equations
         for i in range(min_index, max_index):
             for eq in equations:
                 try:
@@ -768,32 +626,101 @@ void {func_name}("""
                     rhs = eq.rhs
                     result_var = str(lhs.base)
                     
-                    # Substitute variables in the expression
+                    # Substitute variables
                     expr_subs = rhs
-                    
-                    # Handle indexed expressions with stencil patterns
                     indexed_exprs = list(rhs.atoms(sp.Indexed))
                     for indexed_expr in indexed_exprs:
                         base_name = str(indexed_expr.base)
                         if base_name in symbol_map and isinstance(symbol_map[base_name], np.ndarray):
-                            index_expr = indexed_expr.indices[0]
-                            offset = self._parse_index_offset(index_expr)
-                            
-                            access_index = i + offset
-                            if 0 <= access_index < len(symbol_map[base_name]):
-                                value = symbol_map[base_name][access_index]
-                                expr_subs = expr_subs.subs(indexed_expr, value)
+                            # Simple 1D index substitution
+                            value = symbol_map[base_name][i]
+                            expr_subs = expr_subs.subs(indexed_expr, value)
                     
-                    # Substitute scalar variables
+                    # Substitute scalars
                     for var, value in symbol_map.items():
                         if not isinstance(value, np.ndarray):
                             expr_subs = expr_subs.subs(sp.Symbol(var), value)
                     
-                    # Evaluate the result
+                    # Evaluate result
+                    result_idx = result_vars.index(result_var)
                     symbol_map[result_var][i] = float(expr_subs.evalf())
                     
-                except Exception as e:
+                except Exception:
+                    result_idx = result_vars.index(result_var)
                     symbol_map[result_var][i] = 0.0
+    
+    def _compute_2d_equations(self, equations: List[sp.Eq], symbol_map: Dict[str, Any], 
+                            result_vars: List[str], stencil_info: MultiDimStencilInfo, 
+                            array_dims: Dict[str, int], rows: int, cols: int):
+        """Compute 2D equations directly."""
+        for i in range(rows):
+            for j in range(cols):
+                for eq in equations:
+                    try:
+                        lhs = eq.lhs
+                        rhs = eq.rhs
+                        result_var = str(lhs.base)
+                        
+                        # Substitute variables
+                        expr_subs = rhs
+                        indexed_exprs = list(rhs.atoms(sp.Indexed))
+                        for indexed_expr in indexed_exprs:
+                            base_name = str(indexed_expr.base)
+                            if base_name in symbol_map and isinstance(symbol_map[base_name], np.ndarray):
+                                # 2D index substitution
+                                flat_index = i * cols + j
+                                value = symbol_map[base_name][flat_index]
+                                expr_subs = expr_subs.subs(indexed_expr, value)
+                        
+                        # Substitute scalars
+                        for var, value in symbol_map.items():
+                            if not isinstance(value, np.ndarray):
+                                expr_subs = expr_subs.subs(sp.Symbol(var), value)
+                        
+                        # Evaluate result
+                        flat_index = i * cols + j
+                        symbol_map[result_var][flat_index] = float(expr_subs.evalf())
+                        
+                    except Exception:
+                        flat_index = i * cols + j
+                        symbol_map[result_var][flat_index] = 0.0
+    
+    def _compute_3d_equations(self, equations: List[sp.Eq], symbol_map: Dict[str, Any], 
+                            result_vars: List[str], stencil_info: MultiDimStencilInfo, 
+                            array_dims: Dict[str, int], rows: int, cols: int, depth: int):
+        """Compute 3D equations directly."""
+        for i in range(rows):
+            for j in range(cols):
+                for k in range(depth):
+                    for eq in equations:
+                        try:
+                            lhs = eq.lhs
+                            rhs = eq.rhs
+                            result_var = str(lhs.base)
+                            
+                            # Substitute variables
+                            expr_subs = rhs
+                            indexed_exprs = list(rhs.atoms(sp.Indexed))
+                            for indexed_expr in indexed_exprs:
+                                base_name = str(indexed_expr.base)
+                                if base_name in symbol_map and isinstance(symbol_map[base_name], np.ndarray):
+                                    # 3D index substitution
+                                    flat_index = i * cols * depth + j * depth + k
+                                    value = symbol_map[base_name][flat_index]
+                                    expr_subs = expr_subs.subs(indexed_expr, value)
+                            
+                            # Substitute scalars
+                            for var, value in symbol_map.items():
+                                if not isinstance(value, np.ndarray):
+                                    expr_subs = expr_subs.subs(sp.Symbol(var), value)
+                            
+                            # Evaluate result
+                            flat_index = i * cols * depth + j * depth + k
+                            symbol_map[result_var][flat_index] = float(expr_subs.evalf())
+                            
+                        except Exception:
+                            flat_index = i * cols * depth + j * depth + k
+                            symbol_map[result_var][flat_index] = 0.0
 
 
 def genFunc(equations: Union[sp.Eq, List[sp.Eq]]) -> callable:

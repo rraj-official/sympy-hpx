@@ -1,20 +1,39 @@
 """
-SymPy-based code generation for HPX Python API v3 - Multiple Equations
-Generates C++ functions from multiple SymPy equations processed together for efficiency.
+SymPy-based code generation for HPX Python API v3 - Multi-Equation Support
+Extends v2 with support for processing multiple equations simultaneously.
 """
 
 import os
 import subprocess
-import tempfile
 import hashlib
-from typing import Dict, List, Tuple, Any, Set, Union
+import atexit
+import re
+from typing import Dict, List, Tuple, Any, Union
 import sympy as sp
 import numpy as np
-import re
+
+
+# Global set to track generated files for cleanup
+_generated_files = set()
+
+
+def _cleanup_generated_files():
+    """Cleanup function to remove generated files on exit."""
+    for file_path in _generated_files.copy():
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                _generated_files.discard(file_path)
+        except OSError:
+            pass  # File might already be deleted
+
+
+# Register cleanup function to run on exit
+atexit.register(_cleanup_generated_files)
 
 
 class StencilInfo:
-    """Information about stencil patterns in an expression."""
+    """Information about stencil patterns in multi-equation expressions."""
     def __init__(self):
         self.min_offset = 0
         self.max_offset = 0
@@ -39,7 +58,6 @@ class MultiEquationCodeGenerator:
     """
     
     def __init__(self):
-        self.temp_dir = tempfile.mkdtemp()
         self.compiled_functions = {}
         
     def _analyze_equations(self, equations: List[sp.Eq]) -> Tuple[List[str], List[str], List[str], StencilInfo]:
@@ -57,7 +75,7 @@ class MultiEquationCodeGenerator:
         result_vars = []
         stencil_info = StencilInfo()
         
-        # Process each equation
+        # Analyze each equation
         for eq in equations:
             lhs = eq.lhs
             rhs = eq.rhs
@@ -71,17 +89,20 @@ class MultiEquationCodeGenerator:
             
             # Find all IndexedBase objects in this equation
             indexed_bases = list(eq.atoms(sp.IndexedBase))
-            for base in indexed_bases:
-                all_vector_vars.add(str(base))
+            equation_vectors = [str(base) for base in indexed_bases]
+            all_vector_vars.update(equation_vectors)
             
-            # Analyze stencil patterns in this equation
+            # Analyze stencil patterns
             indexed_exprs = list(eq.atoms(sp.Indexed))
             for indexed in indexed_exprs:
                 for idx_expr in indexed.indices:
                     offset = self._parse_index_offset(idx_expr)
                     stencil_info.add_offset(offset)
             
-            # Get index variables from this equation
+            # Find scalar variables in this equation
+            all_symbols = list(eq.atoms(sp.Symbol))
+            
+            # Get index variables for this equation
             index_vars = set()
             for indexed in indexed_exprs:
                 for idx in indexed.indices:
@@ -92,102 +113,75 @@ class MultiEquationCodeGenerator:
                             if isinstance(sym, (sp.Symbol, sp.Idx)):
                                 index_vars.add(str(sym))
             
-            # Find scalar variables in this equation
-            all_symbols = list(eq.atoms(sp.Symbol))
+            # Add scalar variables from this equation
             for symbol in all_symbols:
                 symbol_name = str(symbol)
-                
-                # Skip if this symbol name corresponds to an IndexedBase
-                if symbol_name in all_vector_vars:
-                    continue
-                    
-                # Skip if this is an index variable
-                if symbol_name in index_vars:
-                    continue
-                
-                # Add to scalar variables
-                all_scalar_vars.add(symbol_name)
-        
-        # Separate input vectors from result vectors
-        input_vector_vars = []
-        for var in sorted(all_vector_vars):
-            if var not in result_vars:
-                input_vector_vars.append(var)
+                if symbol_name not in equation_vectors and symbol_name not in index_vars:
+                    all_scalar_vars.add(symbol_name)
         
         # Convert to sorted lists
-        vector_vars = sorted(input_vector_vars)
+        vector_vars = sorted(list(all_vector_vars))
         scalar_vars = sorted(list(all_scalar_vars))
-        result_vars = sorted(list(set(result_vars)))  # Remove duplicates and sort
         
-        return vector_vars, scalar_vars, result_vars, stencil_info
+        # Remove result variables from input vectors
+        input_vector_vars = [var for var in vector_vars if var not in result_vars]
+        
+        return input_vector_vars, scalar_vars, result_vars, stencil_info
     
     def _parse_index_offset(self, idx_expr) -> int:
-        """
-        Parse an index expression to extract the offset.
-        Examples: i -> 0, i+1 -> 1, i-2 -> -2
-        """
+        """Parse index expression to extract offset (same as v2)."""
         if isinstance(idx_expr, (sp.Symbol, sp.Idx)):
             return 0
         elif isinstance(idx_expr, sp.Add):
-            # Handle expressions like i+1, i-2
             offset = 0
             for arg in idx_expr.args:
                 if isinstance(arg, sp.Integer):
                     offset += int(arg)
                 elif isinstance(arg, sp.Mul) and len(arg.args) == 2:
-                    # Handle expressions like -2 (which is Mul(-1, 2))
                     if isinstance(arg.args[0], sp.Integer) and isinstance(arg.args[1], sp.Integer):
                         offset += int(arg.args[0]) * int(arg.args[1])
             return offset
         elif isinstance(idx_expr, sp.Integer):
             return int(idx_expr)
         else:
-            # For complex expressions, try to evaluate numerically
-            try:
-                # Replace any symbols with 0 to get the constant offset
-                simplified = idx_expr
-                for sym in idx_expr.free_symbols:
-                    simplified = simplified.subs(sym, 0)
-                return int(simplified)
-            except:
-                return 0
+            return 0
     
     def _generate_cpp_code(self, equations: List[sp.Eq], func_name: str) -> str:
         """
-        Generate C++ code for multiple SymPy equations.
+        Generate C++ code for multiple equations.
         """
         vector_vars, scalar_vars, result_vars, stencil_info = self._analyze_equations(equations)
         
-        # Generate function signature with raw pointers for easier ctypes integration
+        # Generate function signature
         cpp_code = f"""#include <cmath>
 
 extern "C" {{
 
 void {func_name}("""
         
-        # Add result parameters first (raw pointers, in alphabetical order)
+        # Result parameters first (one for each output vector)
         for i, var in enumerate(result_vars):
             if i > 0:
                 cpp_code += ",\n               "
             cpp_code += f"double* result_{var}"
         
-        # Add input vector parameters (raw pointers, alphabetically ordered)
+        # Input vector parameters
         for var in vector_vars:
             cpp_code += f",\n               const double* {var}"
         
-        # Add scalar parameters (alphabetically ordered) 
+        # Scalar parameters
         for var in scalar_vars:
             cpp_code += f",\n               const double {var}"
             
-        # Add size parameter
+        # Size parameter
         cpp_code += ",\n               const int n"
         cpp_code += ")\n{\n"
         
         # Generate stencil bounds
         if stencil_info.offsets and (stencil_info.min_offset < 0 or stencil_info.max_offset > 0):
             min_bound, max_bound = stencil_info.get_loop_bounds("n")
-            cpp_code += f"    const int min_index = {min_bound}; // from stencil pattern\n"
-            cpp_code += f"    const int max_index = {max_bound}; // from stencil pattern\n"
+            cpp_code += f"    const int min_index = {min_bound};\n"
+            cpp_code += f"    const int max_index = {max_bound};\n"
             loop_start = "min_index"
             loop_end = "max_index"
         else:
@@ -204,7 +198,7 @@ void {func_name}("""
             rhs = eq.rhs
             result_var = str(lhs.base)
             
-            # Convert SymPy expression to C++ code
+            # Convert expression to C++ code
             rhs_str = self._convert_expression_to_cpp(rhs, vector_vars, scalar_vars, result_vars)
             
             cpp_code += f"        result_{result_var}[i] = {rhs_str};\n"
@@ -215,71 +209,33 @@ void {func_name}("""
         return cpp_code
     
     def _convert_expression_to_cpp(self, expr, vector_vars: List[str], scalar_vars: List[str], result_vars: List[str]) -> str:
-        """
-        Convert a SymPy expression to C++ code string.
-        """
+        """Convert SymPy expression to C++ code."""
         expr_str = str(expr)
         
-        # Replace indexed expressions with C++ array access
+        # Handle indexed expressions
         indexed_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*)\[([^\]]+)\]'
         
         def replace_indexed(match):
             var_name = match.group(1)
             index_expr = match.group(2)
             
-            # Check if this is an input vector variable
             if var_name in vector_vars:
-                # Parse the index expression
-                if index_expr == 'i':
-                    return f"{var_name}[i]"
-                else:
-                    # Handle expressions like i+1, i-2
-                    # Simple parsing for common patterns
-                    if '+' in index_expr:
-                        parts = index_expr.split('+')
-                        if len(parts) == 2 and parts[0].strip() == 'i':
-                            offset = parts[1].strip()
-                            return f"{var_name}[i + {offset}]"
-                    elif '-' in index_expr and not index_expr.startswith('-'):
-                        parts = index_expr.split('-')
-                        if len(parts) == 2 and parts[0].strip() == 'i':
-                            offset = parts[1].strip()
-                            return f"{var_name}[i - {offset}]"
-                    
-                    # Fallback: use the expression as-is
-                    return f"{var_name}[{index_expr}]"
-            
-            # Check if this is a result variable (for dependencies between equations)
+                # Input vector
+                return f"{var_name}[{index_expr}]"
             elif var_name in result_vars:
-                # Parse the index expression
-                if index_expr == 'i':
-                    return f"result_{var_name}[i]"
-                else:
-                    # Handle expressions like i+1, i-2
-                    if '+' in index_expr:
-                        parts = index_expr.split('+')
-                        if len(parts) == 2 and parts[0].strip() == 'i':
-                            offset = parts[1].strip()
-                            return f"result_{var_name}[i + {offset}]"
-                    elif '-' in index_expr and not index_expr.startswith('-'):
-                        parts = index_expr.split('-')
-                        if len(parts) == 2 and parts[0].strip() == 'i':
-                            offset = parts[1].strip()
-                            return f"result_{var_name}[i - {offset}]"
-                    
-                    # Fallback: use the expression as-is
-                    return f"result_{var_name}[{index_expr}]"
-            
-            return match.group(0)  # Return unchanged if not a vector variable
+                # Output vector (for dependencies)
+                return f"result_{var_name}[{index_expr}]"
+            else:
+                # Unknown variable, keep as-is
+                return match.group(0)
         
         expr_str = re.sub(indexed_pattern, replace_indexed, expr_str)
         
-        # Replace scalar variables with their parameter names
+        # Replace scalar variables
         for var in scalar_vars:
-            expr_str = re.sub(r'\b' + re.escape(var) + r'\b', f"{var}", expr_str)
-            
-        # Convert Python operators to C++ equivalents
-        # Handle power operator ** -> pow()
+            expr_str = re.sub(r'\b' + re.escape(var) + r'\b', var, expr_str)
+        
+        # Handle power operators
         power_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*\[[^\]]+\]|\([^)]+\)|\w+)\*\*(\d+(?:\.\d+)?|\([^)]+\)|\w+)'
         def power_replacement(match):
             base = match.group(1)
@@ -296,19 +252,18 @@ void {func_name}("""
         """
         # Create unique filename based on code hash
         code_hash = hashlib.md5(cpp_code.encode()).hexdigest()[:8]
-        cpp_file = os.path.join(self.temp_dir, f"{func_name}_{code_hash}.cpp")
-        so_file = os.path.join(self.temp_dir, f"{func_name}_{code_hash}.so")
+        cpp_file = f"generated_{func_name}_{code_hash}.cpp"
+        so_file = f"generated_{func_name}_{code_hash}.so"
         
-        # Also save to current directory for inspection
-        local_cpp_file = f"generated_{func_name}.cpp"
-        
-        # Write C++ code to both temp and local files
+        # Write C++ code to local file
         with open(cpp_file, 'w') as f:
             f.write(cpp_code)
-        with open(local_cpp_file, 'w') as f:
-            f.write(cpp_code)
             
-        print(f"Generated C++ code saved to: {local_cpp_file}")
+        print(f"Generated C++ code saved to: {cpp_file}")
+        
+        # Track files for cleanup
+        _generated_files.add(cpp_file)
+        _generated_files.add(so_file)
             
         # Compile to shared library
         compile_cmd = [
@@ -317,8 +272,12 @@ void {func_name}("""
         ]
         
         try:
-            subprocess.run(compile_cmd, check=True, capture_output=True, text=True)
+            result = subprocess.run(compile_cmd, check=True, capture_output=True, text=True)
+            print(f"Compilation successful for: {so_file}")
         except subprocess.CalledProcessError as e:
+            print(f"Compilation command: {' '.join(compile_cmd)}")
+            print(f"Compilation stderr: {e.stderr}")
+            print(f"Compilation stdout: {e.stdout}")
             raise RuntimeError(f"Compilation failed: {e.stderr}")
             
         return so_file
@@ -330,8 +289,9 @@ void {func_name}("""
         import ctypes
         from ctypes import POINTER, c_double, c_int
         
-        # Load the shared library
-        lib = ctypes.CDLL(so_file)
+        # Load the shared library (use absolute path)
+        abs_so_file = os.path.abspath(so_file)
+        lib = ctypes.CDLL(abs_so_file)
         
         # Get function signature info
         vector_vars, scalar_vars, result_vars, stencil_info = self._analyze_equations(equations)
@@ -488,8 +448,8 @@ void {func_name}("""
                     result_idx = result_vars.index(result_var)
                     result_arrays[result_idx][i] = float(expr_subs.evalf())
                     
-                except Exception as e:
-                    # Fallback for complex expressions
+                except Exception:
+                    # If evaluation fails, set to 0.0
                     result_idx = result_vars.index(result_var)
                     result_arrays[result_idx][i] = 0.0
 

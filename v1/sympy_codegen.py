@@ -5,11 +5,31 @@ Generates C++ functions from SymPy expressions and compiles them into callable P
 
 import os
 import subprocess
-import tempfile
 import hashlib
+import atexit
+import weakref
 from typing import Dict, List, Tuple, Any
 import sympy as sp
 import numpy as np
+
+
+# Global set to track generated files for cleanup
+_generated_files = set()
+
+
+def _cleanup_generated_files():
+    """Cleanup function to remove generated files on exit."""
+    for file_path in _generated_files.copy():
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                _generated_files.discard(file_path)
+        except OSError:
+            pass  # File might already be deleted
+
+
+# Register cleanup function to run on exit
+atexit.register(_cleanup_generated_files)
 
 
 class SymPyCodeGenerator:
@@ -18,7 +38,6 @@ class SymPyCodeGenerator:
     """
     
     def __init__(self):
-        self.temp_dir = tempfile.mkdtemp()
         self.compiled_functions = {}
         
     def _analyze_expression(self, eq: sp.Eq) -> Tuple[List[str], List[str], str]:
@@ -113,21 +132,25 @@ void {func_name}("""
         rhs = eq.rhs
         rhs_str = str(rhs)
         
-        # Replace indexed variables with C++ array access
-        # First, replace indexed expressions like a[i] with a[i] (already correct for raw pointers)
-        for var in vector_vars:
-            if var != result_var:  # Don't replace result variable in RHS
-                # The variable names are already correct for raw pointer access
-                pass
+        # Replace indexed expressions with array access
+        import re
         
-        # Then replace scalar variables with their parameter names (remove 's' prefix)
+        # Pattern to match indexed expressions like a[i], b[i+1], etc.
+        indexed_pattern = r'(\w+)\[([^\]]+)\]'
+        
+        def replace_indexed(match):
+            var_name = match.group(1)
+            index_expr = match.group(2)
+            return f"{var_name}[{index_expr}]"
+        
+        rhs_str = re.sub(indexed_pattern, replace_indexed, rhs_str)
+        
+        # Replace scalar variables with their parameter names
         for var in scalar_vars:
-            rhs_str = rhs_str.replace(var, var)  # Keep original name
+            rhs_str = re.sub(r'\b' + re.escape(var) + r'\b', f"{var}", rhs_str)
             
         # Convert Python operators to C++ equivalents
         # Handle power operator ** -> pow()
-        import re
-        # Replace patterns like "a[i]**2" with "pow(a[i], 2)"
         power_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*\[[^\]]+\]|\([^)]+\)|\w+)\*\*(\d+(?:\.\d+)?|\([^)]+\)|\w+)'
         def power_replacement(match):
             base = match.group(1)
@@ -135,7 +158,7 @@ void {func_name}("""
             return f"pow({base}, {exponent})"
         
         rhs_str = re.sub(power_pattern, power_replacement, rhs_str)
-            
+        
         cpp_code += f"        result[i] = {rhs_str};\n"
         cpp_code += "    }\n"
         cpp_code += "}\n\n}"
@@ -148,19 +171,18 @@ void {func_name}("""
         """
         # Create unique filename based on code hash
         code_hash = hashlib.md5(cpp_code.encode()).hexdigest()[:8]
-        cpp_file = os.path.join(self.temp_dir, f"{func_name}_{code_hash}.cpp")
-        so_file = os.path.join(self.temp_dir, f"{func_name}_{code_hash}.so")
+        cpp_file = f"generated_{func_name}_{code_hash}.cpp"
+        so_file = f"generated_{func_name}_{code_hash}.so"
         
-        # Also save to current directory for inspection
-        local_cpp_file = f"generated_{func_name}.cpp"
-        
-        # Write C++ code to both temp and local files
+        # Write C++ code to local file
         with open(cpp_file, 'w') as f:
             f.write(cpp_code)
-        with open(local_cpp_file, 'w') as f:
-            f.write(cpp_code)
             
-        print(f"Generated C++ code saved to: {local_cpp_file}")
+        print(f"Generated C++ code saved to: {cpp_file}")
+        
+        # Track files for cleanup
+        _generated_files.add(cpp_file)
+        _generated_files.add(so_file)
             
         # Compile to shared library
         compile_cmd = [
@@ -169,8 +191,12 @@ void {func_name}("""
         ]
         
         try:
-            subprocess.run(compile_cmd, check=True, capture_output=True, text=True)
+            result = subprocess.run(compile_cmd, check=True, capture_output=True, text=True)
+            print(f"Compilation successful for: {so_file}")
         except subprocess.CalledProcessError as e:
+            print(f"Compilation command: {' '.join(compile_cmd)}")
+            print(f"Compilation stderr: {e.stderr}")
+            print(f"Compilation stdout: {e.stdout}")
             raise RuntimeError(f"Compilation failed: {e.stderr}")
             
         return so_file
@@ -182,8 +208,9 @@ void {func_name}("""
         import ctypes
         from ctypes import POINTER, c_double, c_int
         
-        # Load the shared library
-        lib = ctypes.CDLL(so_file)
+        # Load the shared library (use absolute path)
+        abs_so_file = os.path.abspath(so_file)
+        lib = ctypes.CDLL(abs_so_file)
         
         # Get function signature info
         vector_vars, scalar_vars, result_var = self._analyze_expression(eq)
@@ -264,54 +291,53 @@ void {func_name}("""
     
     def _compute_directly(self, eq: sp.Eq, result_array, vector_args, scalar_args, vector_vars, scalar_vars, result_var):
         """
-        Direct computation fallback (for demonstration purposes).
-        In a full implementation, this would call the compiled C++ function.
+        Direct computation of the equation using SymPy evaluation.
         """
         n = len(result_array)
         
         # Create symbol mapping
         symbol_map = {}
         
-        # Map vector variables
-        vec_idx = 0
+        # Map vector variables to their arrays
+        vector_idx = 0
         for var in vector_vars:
             if var != result_var:
-                symbol_map[var] = vector_args[vec_idx]
-                vec_idx += 1
+                symbol_map[var] = vector_args[vector_idx]
+                vector_idx += 1
         
-        # Map scalar variables
+        # Map scalar variables to their values
         for i, var in enumerate(scalar_vars):
             symbol_map[var] = scalar_args[i]
         
-        # Evaluate the expression for each index
-        rhs = eq.rhs
+        # Evaluate the equation for each index
         for i in range(n):
-            # Substitute indexed variables
-            expr_subs = rhs
-            for var, values in symbol_map.items():
-                if isinstance(values, np.ndarray):
-                    # Replace indexed access
-                    var_indexed = sp.Symbol(f"{var}[i]")  # This is simplified
-                    # In practice, you'd need more sophisticated substitution
-                else:
-                    # Scalar substitution
-                    expr_subs = expr_subs.subs(sp.Symbol(var), values)
-            
-            # For this example, let's handle the specific case mentioned in requirements
-            # r[i] = d*a[i] + b[i]*c[i]
-            if len(vector_args) >= 3 and len(scalar_args) >= 1:
-                a_val = vector_args[0][i] if len(vector_args) > 0 else 0
-                b_val = vector_args[1][i] if len(vector_args) > 1 else 0  
-                c_val = vector_args[2][i] if len(vector_args) > 2 else 0
-                d_val = scalar_args[0] if len(scalar_args) > 0 else 1
+            try:
+                # Get the right-hand side of the equation
+                rhs = eq.rhs
                 
-                result_array[i] = d_val * a_val + b_val * c_val
-            else:
+                # Substitute indexed expressions
+                expr_subs = rhs
+                indexed_exprs = list(rhs.atoms(sp.Indexed))
+                for indexed_expr in indexed_exprs:
+                    base_name = str(indexed_expr.base)
+                    if base_name in symbol_map and isinstance(symbol_map[base_name], np.ndarray):
+                        # For now, assume simple index i
+                        value = symbol_map[base_name][i]
+                        expr_subs = expr_subs.subs(indexed_expr, value)
+                
+                # Substitute scalar variables
+                for var, value in symbol_map.items():
+                    if not isinstance(value, np.ndarray):
+                        expr_subs = expr_subs.subs(sp.Symbol(var), value)
+                
                 # Fallback: try to evaluate symbolically
                 try:
                     result_array[i] = float(expr_subs.evalf())
                 except:
                     result_array[i] = 0.0
+            except Exception:
+                # If evaluation fails, set to 0.0
+                result_array[i] = 0.0
 
 
 def genFunc(equation: sp.Eq) -> callable:
