@@ -44,7 +44,7 @@ def test_basic_functionality():
     
     # Call the generated function
     print("\nCalling generated function...")
-    a_bc(vr, va, vb, vc, d_val)
+    a_bc(r=vr, a=va, b=vb, c=vc, d=d_val)
     
     print(f"Result vr = {vr}")
     
@@ -88,7 +88,7 @@ def test_larger_vectors():
     print(f"Testing with vectors of size {size}")
     
     # Call the generated function
-    a_bc(vr, va, vb, vc, d_val)
+    a_bc(r=vr, a=va, b=vb, c=vc, d=d_val)
     
     # Verify the result
     expected = d_val * va + vb * vc
@@ -129,7 +129,7 @@ def test_different_expression():
     print(f"c = {c_val}")
     
     # Call the function
-    func(vresult, va, vb, c_val)
+    func(result=vresult, a=va, b=vb, c=c_val)
     
     print(f"Result = {vresult}")
     

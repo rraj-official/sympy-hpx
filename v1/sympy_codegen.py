@@ -24,6 +24,10 @@ def _cleanup_generated_files():
             if os.path.exists(file_path):
                 os.remove(file_path)
                 _generated_files.discard(file_path)
+            elif os.path.isdir(file_path): # Also remove build directories
+                import shutil
+                shutil.rmtree(file_path)
+                _generated_files.discard(file_path)
         except OSError:
             pass  # File might already be deleted
 
@@ -95,110 +99,126 @@ class SymPyCodeGenerator:
         
         return vector_vars, scalar_vars, result_var
     
-    def _generate_cpp_code(self, eq: sp.Eq, func_name: str) -> str:
+    def _generate_cpp_code(self, eq: sp.Eq, func_name: str) -> Tuple[str, str]:
         """
-        Generate C++ code for the given SymPy equation.
+        Generate C++ code and CMakeLists.txt for the given SymPy equation.
         """
         vector_vars, scalar_vars, result_var = self._analyze_expression(eq)
-        
-        # Generate function signature with raw pointers for easier ctypes integration
-        cpp_code = f"""#include <cmath>
 
-extern "C" {{
+        # Build parameter list for C++ functions
+        params = [f"double* {result_var}"]
+        for var in sorted(vector_vars):
+            if var != result_var:
+                params.append(f"const double* {var}")
+        params.append("int n")
+        for var in sorted(scalar_vars):
+            params.append(f"const double {var}")
+        param_str = ", ".join(params)
 
-void {func_name}("""
-        
-        # Add result parameter first (raw pointer)
-        cpp_code += f"double* result"
-        
-        # Add vector parameters (raw pointers, alphabetically ordered)
-        for var in vector_vars:
-            if var != result_var:  # Don't duplicate result variable
-                cpp_code += f",\n               const double* {var}"
-        
-        # Add scalar parameters (alphabetically ordered) 
-        for var in scalar_vars:
-            cpp_code += f",\n               const double {var}"
-            
-        # Add size parameter
-        cpp_code += ",\n               const int n"
-        cpp_code += ")\n{\n"
-        
-        # Generate the loop body
-        cpp_code += "    // Generated loop\n"
-        cpp_code += "    for(int i = 0; i < n; i++) {\n"
-        
-        # Convert SymPy expression to C++ code
-        rhs = eq.rhs
-        rhs_str = str(rhs)
-        
-        # Replace indexed expressions with array access
+        # Build argument list for kernel call
+        arg_list = [result_var]
+        for var in sorted(vector_vars):
+            if var != result_var:
+                arg_list.append(var)
+        arg_list.append("n")
+        arg_list.extend(sorted(scalar_vars))
+        arg_list_str = ", ".join(arg_list)
+
+        # Convert SymPy expression to C++
+        rhs = self._convert_expression_to_cpp(eq.rhs, vector_vars, scalar_vars, result_var)
+
+        cpp_code = f"""
+#include <hpx/init.hpp>
+#include <hpx/hpx_start.hpp>
+#include <hpx/algorithm.hpp>
+#include <hpx/execution.hpp>
+#include <cmath>
+
+int hpx_kernel({param_str})
+{{
+    hpx::experimental::for_loop(hpx::execution::par, 0, n, [=](std::size_t i) {{
+        {result_var}[i] = {rhs};
+    }});
+    return hpx::finalize();
+}}
+
+extern "C" void {func_name}({param_str})
+{{
+    hpx::start(0, nullptr);
+    hpx::async([&]() {{
+        return hpx_kernel({arg_list_str});
+    }}).get();
+    hpx::stop();
+}}
+"""
+
+        cmake_code = f"""
+cmake_minimum_required(VERSION 3.10)
+project(sympy_hpx_kernel)
+find_package(HPX COMPONENTS init REQUIRED)
+add_library({func_name} SHARED kernel.cpp)
+target_link_libraries({func_name} PRIVATE HPX::hpx HPX::hpx_init)
+"""
+        cmake_code = cmake_code.replace("COMPONENTS init ", "") \
+                       .replace(" HPX::hpx_init", "")
+        return cpp_code, cmake_code
+
+    def _convert_expression_to_cpp(self, expr, vector_vars, scalar_vars, result_var):
+        """Converts a SymPy expression to a C++ string."""
         import re
+        expr_str = str(expr)
         
-        # Pattern to match indexed expressions like a[i], b[i+1], etc.
         indexed_pattern = r'(\w+)\[([^\]]+)\]'
-        
         def replace_indexed(match):
             var_name = match.group(1)
             index_expr = match.group(2)
-            return f"{var_name}[{index_expr}]"
-        
-        rhs_str = re.sub(indexed_pattern, replace_indexed, rhs_str)
-        
-        # Replace scalar variables with their parameter names
+            if var_name in vector_vars or var_name == result_var:
+                 return f"{var_name}[{index_expr}]"
+            return match.group(0)
+        expr_str = re.sub(indexed_pattern, replace_indexed, expr_str)
+
         for var in scalar_vars:
-            rhs_str = re.sub(r'\b' + re.escape(var) + r'\b', f"{var}", rhs_str)
+            expr_str = re.sub(r'\b' + re.escape(var) + r'\b', var, expr_str)
             
-        # Convert Python operators to C++ equivalents
-        # Handle power operator ** -> pow()
         power_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*\[[^\]]+\]|\([^)]+\)|\w+)\*\*(\d+(?:\.\d+)?|\([^)]+\)|\w+)'
         def power_replacement(match):
-            base = match.group(1)
-            exponent = match.group(2)
+            base, exponent = match.groups()
             return f"pow({base}, {exponent})"
-        
-        rhs_str = re.sub(power_pattern, power_replacement, rhs_str)
-        
-        cpp_code += f"        result[i] = {rhs_str};\n"
-        cpp_code += "    }\n"
-        cpp_code += "}\n\n}"
-        
-        return cpp_code
-    
-    def _compile_cpp_code(self, cpp_code: str, func_name: str) -> str:
+        return re.sub(power_pattern, power_replacement, expr_str)
+
+    def _compile_cpp_code(self, cpp_code_pair: Tuple[str, str], func_name: str) -> str:
         """
-        Compile the C++ code into a shared library and return the path.
+        Compile the C++ code into a shared library using CMake.
         """
-        # Create unique filename based on code hash
-        code_hash = hashlib.md5(cpp_code.encode()).hexdigest()[:8]
-        cpp_file = f"generated_{func_name}_{code_hash}.cpp"
-        so_file = f"generated_{func_name}_{code_hash}.so"
+        cpp_code, cmake_code = cpp_code_pair
+        build_dir = f"build_{func_name}"
+
+        if not os.path.exists(build_dir):
+            os.makedirs(build_dir)
         
-        # Write C++ code to local file
-        with open(cpp_file, 'w') as f:
+        with open(os.path.join(build_dir, "kernel.cpp"), "w") as f:
             f.write(cpp_code)
+        with open(os.path.join(build_dir, "CMakeLists.txt"), "w") as f:
+            f.write(cmake_code)
             
-        print(f"Generated C++ code saved to: {cpp_file}")
+        print(f"Building HPX kernel in {build_dir}...")
         
-        # Track files for cleanup
-        _generated_files.add(cpp_file)
-        _generated_files.add(so_file)
-            
-        # Compile to shared library
-        compile_cmd = [
-            "g++", "-shared", "-fPIC", "-O3", "-std=c++17",
-            cpp_file, "-o", so_file
-        ]
+        cmake_cmd = ["cmake", f"-DHPX_DIR={os.environ.get('HOME')}/hpx-install/lib/cmake/HPX", "."]
         
         try:
-            result = subprocess.run(compile_cmd, check=True, capture_output=True, text=True)
-            print(f"Compilation successful for: {so_file}")
+            subprocess.run(cmake_cmd, cwd=build_dir, check=True, capture_output=True, text=True)
+            subprocess.run(["make", "-j"], cwd=build_dir, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as e:
-            print(f"Compilation command: {' '.join(compile_cmd)}")
-            print(f"Compilation stderr: {e.stderr}")
-            print(f"Compilation stdout: {e.stdout}")
-            raise RuntimeError(f"Compilation failed: {e.stderr}")
-            
+            print(f"CMake or Make failed for {func_name}:")
+            print(f"  CMake command: {' '.join(e.cmd)}")
+            print(f"  CMake stderr: {e.stderr}")
+            raise
+
+        so_file = os.path.join(build_dir, f"lib{func_name}.so")
+        if not os.path.exists(so_file):
+             so_file = os.path.join(build_dir, f"{func_name}.so") # Fallback name
+
+        _generated_files.add(build_dir)
         return so_file
     
     def _create_python_wrapper(self, so_file: str, func_name: str, eq: sp.Eq):
@@ -228,7 +248,7 @@ void {func_name}("""
             """
             if len(args) != 1 + len(vector_vars) - (1 if result_var in vector_vars else 0) + len(scalar_vars):
                 expected = 1 + len(vector_vars) - (1 if result_var in vector_vars else 0) + len(scalar_vars)
-                raise ValueError(f"Expected {expected} arguments, got {len(args)}")
+                raise ValueError(f"Expected {{expected}} arguments, got {{len(args)}}")
             
             arg_idx = 0
             
@@ -282,7 +302,7 @@ void {func_name}("""
                 c_func(*call_args)
                 
             except Exception as e:
-                print(f"Failed to call C++ function: {e}")
+                print(f"Failed to call C++ function: {{e}}")
                 print("Falling back to Python computation...")
                 # Fallback to Python computation
                 self._compute_directly(eq, result_array, vector_args, scalar_args, vector_vars, scalar_vars, result_var)
@@ -358,8 +378,8 @@ def genFunc(equation: sp.Eq) -> callable:
     func_name = f"cpp_func_{func_hash}"
     
     # Generate and compile C++ code
-    cpp_code = generator._generate_cpp_code(equation, func_name)
-    so_file = generator._compile_cpp_code(cpp_code, func_name)
+    cpp_code_pair = generator._generate_cpp_code(equation, func_name)
+    so_file = generator._compile_cpp_code(cpp_code_pair, func_name)
     
     # Create Python wrapper
     wrapper = generator._create_python_wrapper(so_file, func_name, equation)
