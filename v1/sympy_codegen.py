@@ -144,23 +144,25 @@ int hpx_kernel({param_str})
 
 extern "C" void {func_name}({param_str})
 {{
-    hpx::start(0, nullptr);
-    hpx::async([&]() {{
+    int argc = 0;
+    char *argv[] = {{ nullptr }};
+    hpx::start(nullptr, argc, argv);
+    hpx::run_as_hpx_thread([&]() {{
         return hpx_kernel({arg_list_str});
-    }}).get();
+    }});
+    hpx::post([](){{ hpx::finalize(); }});
     hpx::stop();
 }}
 """
 
         cmake_code = f"""
-cmake_minimum_required(VERSION 3.10)
-project(sympy_hpx_kernel)
-find_package(HPX COMPONENTS init REQUIRED)
+cmake_minimum_required(VERSION 3.18)
+project(sympy_hpx_kernel LANGUAGES CXX)
+
+find_package(HPX REQUIRED)
 add_library({func_name} SHARED kernel.cpp)
-target_link_libraries({func_name} PRIVATE HPX::hpx HPX::hpx_init)
+target_link_libraries({func_name} PRIVATE HPX::hpx)
 """
-        cmake_code = cmake_code.replace("COMPONENTS init ", "") \
-                       .replace(" HPX::hpx_init", "")
         return cpp_code, cmake_code
 
     def _convert_expression_to_cpp(self, expr, vector_vars, scalar_vars, result_var):
@@ -191,8 +193,13 @@ target_link_libraries({func_name} PRIVATE HPX::hpx HPX::hpx_init)
         Compile the C++ code into a shared library using CMake.
         """
         cpp_code, cmake_code = cpp_code_pair
-        build_dir = f"build_{func_name}"
-
+        
+        # Create build directory inside tmp folder
+        tmp_dir = "tmp"
+        if not os.path.exists(tmp_dir):
+            os.makedirs(tmp_dir)
+        
+        build_dir = os.path.join(tmp_dir, f"build_{func_name}")
         if not os.path.exists(build_dir):
             os.makedirs(build_dir)
         
@@ -203,7 +210,7 @@ target_link_libraries({func_name} PRIVATE HPX::hpx HPX::hpx_init)
             
         print(f"Building HPX kernel in {build_dir}...")
         
-        cmake_cmd = ["cmake", f"-DHPX_DIR={os.environ.get('HOME')}/hpx-install/lib/cmake/HPX", "."]
+        cmake_cmd = ["cmake", f"-DHPX_DIR={os.environ.get('HOME')}/hpx-install-system/lib/cmake/HPX", "."]
         
         try:
             subprocess.run(cmake_cmd, cwd=build_dir, check=True, capture_output=True, text=True)
@@ -241,34 +248,53 @@ target_link_libraries({func_name} PRIVATE HPX::hpx HPX::hpx_init)
                        ("size", c_int),
                        ("capacity", c_int)]
         
-        def wrapper(*args):
+        def wrapper(*args, **kwargs):
             """
             Python wrapper for the compiled C++ function.
-            Arguments should be provided in the order: result_vector, vector_args..., scalar_args...
+            Can be called with positional or keyword arguments.
+            Expected keywords: result_var, vector_vars (excluding result), scalar_vars
             """
-            if len(args) != 1 + len(vector_vars) - (1 if result_var in vector_vars else 0) + len(scalar_vars):
-                expected = 1 + len(vector_vars) - (1 if result_var in vector_vars else 0) + len(scalar_vars)
-                raise ValueError(f"Expected {{expected}} arguments, got {{len(args)}}")
-            
-            arg_idx = 0
-            
-            # Result vector (first argument)
-            result_array = np.asarray(args[arg_idx], dtype=np.float64)
-            arg_idx += 1
-            
-            # Vector arguments (excluding result if it's also in vector_vars)
-            vector_args = []
-            for var in vector_vars:
-                if var != result_var:
-                    vec_array = np.asarray(args[arg_idx], dtype=np.float64)
-                    vector_args.append(vec_array)
-                    arg_idx += 1
-            
-            # Scalar arguments
-            scalar_args = []
-            for var in scalar_vars:
-                scalar_args.append(float(args[arg_idx]))
+            if kwargs:
+                # Handle keyword arguments
+                result_array = np.asarray(kwargs[result_var], dtype=np.float64)
+                
+                # Vector arguments (excluding result if it's also in vector_vars)
+                vector_args = []
+                for var in sorted(vector_vars):
+                    if var != result_var:
+                        vec_array = np.asarray(kwargs[var], dtype=np.float64)
+                        vector_args.append(vec_array)
+                
+                # Scalar arguments
+                scalar_args = []
+                for var in sorted(scalar_vars):
+                    scalar_args.append(float(kwargs[var]))
+                    
+            else:
+                # Handle positional arguments (existing logic)
+                if len(args) != 1 + len(vector_vars) - (1 if result_var in vector_vars else 0) + len(scalar_vars):
+                    expected = 1 + len(vector_vars) - (1 if result_var in vector_vars else 0) + len(scalar_vars)
+                    raise ValueError(f"Expected {{expected}} arguments, got {{len(args)}}")
+                
+                arg_idx = 0
+                
+                # Result vector (first argument)
+                result_array = np.asarray(args[arg_idx], dtype=np.float64)
                 arg_idx += 1
+                
+                # Vector arguments (excluding result if it's also in vector_vars)
+                vector_args = []
+                for var in sorted(vector_vars):
+                    if var != result_var:
+                        vec_array = np.asarray(args[arg_idx], dtype=np.float64)
+                        vector_args.append(vec_array)
+                        arg_idx += 1
+                
+                # Scalar arguments
+                scalar_args = []
+                for var in sorted(scalar_vars):
+                    scalar_args.append(float(args[arg_idx]))
+                    arg_idx += 1
             
             # Get the size and verify all vectors have the same size
             n = len(result_array)

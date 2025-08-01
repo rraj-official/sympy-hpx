@@ -32,4 +32,6 @@ file_count.txt
 
 # OS-specific
 .DS_Store
-Thumbs.db 
+Thumbs.db
+tmp/
+build_cpp_func_*/
