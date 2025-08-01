@@ -168,59 +168,91 @@ class SymPyStencilCodeGenerator:
             # For more complex expressions, default to 0
             return 0
     
-    def _generate_cpp_code(self, eq: sp.Eq, func_name: str) -> str:
+    def _generate_cpp_code(self, eq: sp.Eq, func_name: str) -> Tuple[str, str]:
         """
-        Generate C++ code for the given SymPy equation with stencil support.
+        Generate C++ code and CMakeLists.txt for the given SymPy equation with stencil support.
         """
         vector_vars, scalar_vars, result_var, stencil_info = self._analyze_expression(eq)
-        
-        # Generate function signature with raw pointers for easier ctypes integration
-        cpp_code = f"""#include <cmath>
 
-extern "C" {{
+        # Build parameter list for C++ functions
+        params = [f"double* {result_var}"]
+        for var in sorted(vector_vars):
+            if var != result_var:
+                params.append(f"const double* {var}")
+        params.append("int n")
+        for var in sorted(scalar_vars):
+            params.append(f"const double {var}")
+        param_str = ", ".join(params)
 
-void {func_name}("""
-        
-        # Add result parameter first (raw pointer)
-        cpp_code += f"double* result"
-        
-        # Add vector parameters (raw pointers, alphabetically ordered)
-        for var in vector_vars:
-            if var != result_var:  # Don't duplicate result variable
-                cpp_code += f",\n               const double* {var}"
-        
-        # Add scalar parameters (alphabetically ordered) 
-        for var in scalar_vars:
-            cpp_code += f",\n               const double {var}"
-            
-        # Add size parameter
-        cpp_code += ",\n               const int n"
-        cpp_code += ")\n{\n"
-        
-        # Generate stencil bounds
+        # Build argument list for kernel call
+        arg_list = [result_var]
+        for var in sorted(vector_vars):
+            if var != result_var:
+                arg_list.append(var)
+        arg_list.append("n")
+        arg_list.extend(sorted(scalar_vars))
+        arg_list_str = ", ".join(arg_list)
+
+        # Convert SymPy expression to C++
+        rhs = self._convert_expression_to_cpp(eq.rhs, vector_vars, scalar_vars, result_var)
+
+        # Determine loop bounds for stencil - use compile-time constants
         if stencil_info.offsets and (stencil_info.min_offset < 0 or stencil_info.max_offset > 0):
             min_bound, max_bound = stencil_info.get_loop_bounds("n")
-            cpp_code += f"    const int min_index = {min_bound}; // from stencil pattern\n"
-            cpp_code += f"    const int max_index = {max_bound}; // from stencil pattern\n"
-            loop_start = "min_index"
-            loop_end = "max_index"
+            # Use simple arithmetic for bounds instead of std::max/min
+            if stencil_info.min_offset < 0:
+                start_bound = str(-stencil_info.min_offset)
+            else:
+                start_bound = "0"
+            
+            if stencil_info.max_offset > 0:
+                end_bound = f"n - {stencil_info.max_offset}"
+            else:
+                end_bound = "n"
+                
+            loop_bounds = f"{start_bound}, {end_bound}"
         else:
-            loop_start = "0"
-            loop_end = "n"
+            loop_bounds = "0, n"
+
+        cpp_code = f"""
+#include <hpx/init.hpp>
+#include <hpx/hpx_start.hpp>
+#include <hpx/algorithm.hpp>
+#include <hpx/execution.hpp>
+#include <cmath>
+
+int hpx_kernel({param_str})
+{{
+    // Stencil-aware bounds for safe parallel execution
+    hpx::experimental::for_loop(hpx::execution::par, {loop_bounds}, [=](std::size_t i) {{
+        {result_var}[i] = {rhs};
+    }});
+    return hpx::finalize();
+}}
+
+extern "C" void {func_name}({param_str})
+{{
+    int argc = 0;
+    char *argv[] = {{ nullptr }};
+    hpx::start(nullptr, argc, argv);
+    hpx::run_as_hpx_thread([&]() {{
+        return hpx_kernel({arg_list_str});
+    }});
+    hpx::post([](){{ hpx::finalize(); }});
+    hpx::stop();
+}}
+"""
+
+        cmake_code = f"""
+cmake_minimum_required(VERSION 3.18)
+project(sympy_hpx_stencil LANGUAGES CXX)
+
+find_package(HPX REQUIRED)
+add_library({func_name} SHARED kernel.cpp)
+target_link_libraries({func_name} PRIVATE HPX::hpx)
+"""
         
-        # Generate the loop body
-        cpp_code += f"\n    // Generated stencil loop\n"
-        cpp_code += f"    for(int i = {loop_start}; i < {loop_end}; i++) {{\n"
-        
-        # Convert SymPy expression to C++ code
-        rhs = eq.rhs
-        rhs_str = self._convert_expression_to_cpp(rhs, vector_vars, scalar_vars, result_var)
-        
-        cpp_code += f"        result[i] = {rhs_str};\n"
-        cpp_code += "    }\n"
-        cpp_code += "}\n\n}"
-        
-        return cpp_code
+        return cpp_code, cmake_code
     
     def _convert_expression_to_cpp(self, expr, vector_vars, scalar_vars, result_var) -> str:
         """
@@ -260,40 +292,44 @@ void {func_name}("""
         
         return expr_str
     
-    def _compile_cpp_code(self, cpp_code: str, func_name: str) -> str:
+    def _compile_cpp_code(self, cpp_code_pair: Tuple[str, str], func_name: str) -> str:
         """
-        Compile the C++ code into a shared library and return the path.
+        Compile the C++ code into a shared library using CMake.
         """
-        # Create unique filename based on code hash
-        code_hash = hashlib.md5(cpp_code.encode()).hexdigest()[:8]
-        cpp_file = f"generated_{func_name}_{code_hash}.cpp"
-        so_file = f"generated_{func_name}_{code_hash}.so"
+        cpp_code, cmake_code = cpp_code_pair
         
-        # Write C++ code to local file
-        with open(cpp_file, 'w') as f:
+        # Create build directory inside tmp folder
+        tmp_dir = "tmp"
+        if not os.path.exists(tmp_dir):
+            os.makedirs(tmp_dir)
+        
+        build_dir = os.path.join(tmp_dir, f"build_{func_name}")
+        if not os.path.exists(build_dir):
+            os.makedirs(build_dir)
+        
+        with open(os.path.join(build_dir, "kernel.cpp"), "w") as f:
             f.write(cpp_code)
+        with open(os.path.join(build_dir, "CMakeLists.txt"), "w") as f:
+            f.write(cmake_code)
             
-        print(f"Generated C++ code saved to: {cpp_file}")
+        print(f"Building HPX stencil kernel in {build_dir}...")
         
-        # Track files for cleanup
-        _generated_files.add(cpp_file)
-        _generated_files.add(so_file)
-            
-        # Compile to shared library
-        compile_cmd = [
-            "g++", "-shared", "-fPIC", "-O3", "-std=c++17",
-            cpp_file, "-o", so_file
-        ]
+        cmake_cmd = ["cmake", f"-DHPX_DIR={os.environ.get('HOME')}/hpx-install-system/lib/cmake/HPX", "."]
         
         try:
-            result = subprocess.run(compile_cmd, check=True, capture_output=True, text=True)
-            print(f"Compilation successful for: {so_file}")
+            subprocess.run(cmake_cmd, cwd=build_dir, check=True, capture_output=True, text=True)
+            subprocess.run(["make", "-j"], cwd=build_dir, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as e:
-            print(f"Compilation command: {' '.join(compile_cmd)}")
-            print(f"Compilation stderr: {e.stderr}")
-            print(f"Compilation stdout: {e.stdout}")
-            raise RuntimeError(f"Compilation failed: {e.stderr}")
-            
+            print(f"CMake or Make failed for {func_name}:")
+            print(f"  CMake command: {' '.join(e.cmd)}")
+            print(f"  CMake stderr: {e.stderr}")
+            raise
+
+        so_file = os.path.join(build_dir, f"lib{func_name}.so")
+        if not os.path.exists(so_file):
+             so_file = os.path.join(build_dir, f"{func_name}.so") # Fallback name
+
+        _generated_files.add(build_dir)
         return so_file
     
     def _create_python_wrapper(self, so_file: str, func_name: str, eq: sp.Eq):
@@ -310,34 +346,53 @@ void {func_name}("""
         # Get function signature info
         vector_vars, scalar_vars, result_var, stencil_info = self._analyze_expression(eq)
         
-        def wrapper(*args):
+        def wrapper(*args, **kwargs):
             """
             Python wrapper for the compiled C++ stencil function.
-            Arguments should be provided in the order: result_vector, vector_args..., scalar_args...
+            Can be called with positional or keyword arguments.
+            Expected keywords: result_var, vector_vars (excluding result), scalar_vars
             """
-            expected_args = 1 + len(vector_vars) - (1 if result_var in vector_vars else 0) + len(scalar_vars)
-            if len(args) != expected_args:
-                raise ValueError(f"Expected {expected_args} arguments, got {len(args)}")
-            
-            arg_idx = 0
-            
-            # Result vector (first argument)
-            result_array = np.asarray(args[arg_idx], dtype=np.float64)
-            arg_idx += 1
-            
-            # Vector arguments (excluding result if it's also in vector_vars)
-            vector_args = []
-            for var in vector_vars:
-                if var != result_var:
-                    vec_array = np.asarray(args[arg_idx], dtype=np.float64)
-                    vector_args.append(vec_array)
-                    arg_idx += 1
-            
-            # Scalar arguments
-            scalar_args = []
-            for var in scalar_vars:
-                scalar_args.append(float(args[arg_idx]))
+            if kwargs:
+                # Handle keyword arguments
+                result_array = np.asarray(kwargs[result_var], dtype=np.float64)
+                
+                # Vector arguments (excluding result if it's also in vector_vars)
+                vector_args = []
+                for var in sorted(vector_vars):
+                    if var != result_var:
+                        vec_array = np.asarray(kwargs[var], dtype=np.float64)
+                        vector_args.append(vec_array)
+                
+                # Scalar arguments
+                scalar_args = []
+                for var in sorted(scalar_vars):
+                    scalar_args.append(float(kwargs[var]))
+                    
+            else:
+                # Handle positional arguments (existing logic)
+                expected_args = 1 + len(vector_vars) - (1 if result_var in vector_vars else 0) + len(scalar_vars)
+                if len(args) != expected_args:
+                    raise ValueError(f"Expected {expected_args} arguments, got {len(args)}")
+                
+                arg_idx = 0
+                
+                # Result vector (first argument)
+                result_array = np.asarray(args[arg_idx], dtype=np.float64)
                 arg_idx += 1
+                
+                # Vector arguments (excluding result if it's also in vector_vars)
+                vector_args = []
+                for var in sorted(vector_vars):
+                    if var != result_var:
+                        vec_array = np.asarray(args[arg_idx], dtype=np.float64)
+                        vector_args.append(vec_array)
+                        arg_idx += 1
+                
+                # Scalar arguments
+                scalar_args = []
+                for var in sorted(scalar_vars):
+                    scalar_args.append(float(args[arg_idx]))
+                    arg_idx += 1
             
             # Get the size and verify bounds
             n = len(result_array)
@@ -469,8 +524,8 @@ def genFunc(equation: sp.Eq) -> callable:
     func_name = f"cpp_stencil_{func_hash}"
     
     # Generate and compile C++ code
-    cpp_code = generator._generate_cpp_code(equation, func_name)
-    so_file = generator._compile_cpp_code(cpp_code, func_name)
+    cpp_code_pair = generator._generate_cpp_code(equation, func_name)
+    so_file = generator._compile_cpp_code(cpp_code_pair, func_name)
     
     # Create Python wrapper
     wrapper = generator._create_python_wrapper(so_file, func_name, equation)

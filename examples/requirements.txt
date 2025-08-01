@@ -1,0 +1,25 @@
+# Scientific Computing Examples for sympy-hpx
+# Requirements for running the example scripts
+
+# Core dependencies (should already be installed)
+sympy>=1.11
+numpy>=1.21.0
+
+# Visualization and plotting
+matplotlib>=3.5.0
+seaborn>=0.11.0  # For enhanced statistical plots
+
+# Scientific computing and analysis
+scipy>=1.8.0     # For advanced numerical methods
+pandas>=1.4.0    # For data analysis examples
+
+# Animation and interactive plots (optional but useful)
+imageio>=2.15.0  # For creating animations/GIFs
+pillow>=8.0.0    # Image processing support
+
+# Performance monitoring (optional)
+psutil>=5.8.0    # For system resource monitoring in benchmarks
+
+# Optional: Jupyter support for interactive examples
+# jupyter>=1.0.0
+# ipywidgets>=7.6.0

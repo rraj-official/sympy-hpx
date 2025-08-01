@@ -67,64 +67,104 @@ print(f"   Temperature after one time step:")
 print(f"   Center temperature: {T_new_field[center_i * cols + center_j]:.2f}°C")
 print(f"   Corner temperature: {T_new_field[0]:.2f}°C")
 
-# Example 2: 2D Gradient Calculation
-print(f"\n2. 2D Gradient Calculation")
-print("   Computing gradient magnitude on a 2D field")
+# Example 2: 2D Laplacian (Simple Stencil)
+print(f"\n2. 2D Laplacian Operator")
+print("   Computing discrete Laplacian on a 2D field")
 
-# Symbols for gradient calculation
+# Symbols for Laplacian calculation
 u = IndexedBase("u")      # Input field (2D)
-grad_x = IndexedBase("grad_x")  # Gradient in x direction
-grad_y = IndexedBase("grad_y")  # Gradient in y direction
-grad_mag = IndexedBase("grad_mag")  # Gradient magnitude
+laplacian = IndexedBase("laplacian")  # Laplacian result
 
-# Multi-equation system for 2D gradient
-gradient_equations = [
-    Eq(grad_x[i,j], (u[i+1,j] - u[i-1,j]) / (2*dx)),           # Central difference in x
-    Eq(grad_y[i,j], (u[i,j+1] - u[i,j-1]) / (2*dx)),           # Central difference in y
-    Eq(grad_mag[i,j], (grad_x[i,j]**2 + grad_y[i,j]**2)**0.5)  # Magnitude
-]
+# 2D Laplacian using 5-point stencil: ∇²u = (u[i+1,j] + u[i-1,j] + u[i,j+1] + u[i,j-1] - 4*u[i,j]) / dx²
+laplacian_eq_2d = Eq(laplacian[i,j], (u[i+1,j] + u[i-1,j] + u[i,j+1] + u[i,j-1] - 4*u[i,j]) / (dx**2))
 
-print(f"   Gradient equations:")
-for k, eq in enumerate(gradient_equations):
-    print(f"     {k+1}: {eq}")
+print(f"   Laplacian equation: {laplacian_eq_2d}")
 
-# Generate the gradient function
-print("   Generating 2D gradient function...")
-grad_2d_func = genFunc(gradient_equations)
+# Generate the Laplacian function
+print("   Generating 2D Laplacian function...")
+laplacian_2d_func = genFunc(laplacian_eq_2d)
 print("   Function generated successfully!")
 
-# Create test data - a simple 2D function
-rows, cols = 5, 5
+# Create test data - a simple 2D Gaussian-like function
+rows, cols = 6, 8
 u_field = np.zeros(rows * cols)
-grad_x_field = np.zeros(rows * cols)
-grad_y_field = np.zeros(rows * cols)
-grad_mag_field = np.zeros(rows * cols)
+laplacian_field = np.zeros(rows * cols)
 
-# Initialize u with a quadratic function: u(x,y) = x^2 + y^2
+# Initialize u with a smooth function: u(x,y) = exp(-(x-cx)²-(y-cy)²)
+cx, cy = rows//2, cols//2
 for i in range(rows):
     for j in range(cols):
         idx = i * cols + j
-        x, y = i * 1.0, j * 1.0  # Grid coordinates
-        u_field[idx] = x*x + y*y
+        x, y = i - cx, j - cy
+        u_field[idx] = np.exp(-(x*x + y*y) * 0.1)
 
 dx_val = 1.0
 
-print(f"   Test function: u(x,y) = x² + y²")
+print(f"   Test function: u(x,y) = exp(-(x-cx)²-(y-cy)²)")
 print(f"   Grid size: {rows} x {cols}")
 
-# Call the gradient function
-# Arguments: result_arrays (grad_x, grad_y, grad_mag), input_array (u), shape_params, scalar_params
-grad_2d_func(grad_x_field, grad_y_field, grad_mag_field, u_field, rows, cols, dx_val)
+# Call the Laplacian function
+# Arguments: result_array, input_array, shape_params (rows, cols), scalar_params
+laplacian_2d_func(laplacian_field, u_field, rows, cols, dx_val)
 
 # Check results at center point
-center_idx = (rows//2) * cols + (cols//2)
+center_idx = cx * cols + cy
 print(f"   Results at center point:")
-print(f"   Gradient x: {grad_x_field[center_idx]:.2f}")
-print(f"   Gradient y: {grad_y_field[center_idx]:.2f}")
-print(f"   Gradient magnitude: {grad_mag_field[center_idx]:.2f}")
+print(f"   Original value: {u_field[center_idx]:.3f}")
+print(f"   Laplacian: {laplacian_field[center_idx]:.3f}")
 
-# Example 3: 1D compatibility (backward compatibility with v3)
-print(f"\n3. 1D Backward Compatibility Test")
+# Example 3: 3D Simple Operation
+print(f"\n3. 3D Array Operation")
+print("   Computing 3D weighted average")
+
+# Create SymPy indices for 3D case (using Idx for proper array indexing)
+i_3d = Idx("i")
+j_3d = Idx("j") 
+k_3d = Idx("k")
+u3d = IndexedBase("u3d")      # 3D input field
+result3d = IndexedBase("result3d")  # 3D result
+weight = Symbol("weight")     # Scaling factor
+
+# Simple 3D operation: result[i,j,k] = weight * u3d[i,j,k]
+eq_3d = Eq(result3d[i_3d,j_3d,k_3d], weight * u3d[i_3d,j_3d,k_3d])
+
+print(f"   3D equation: {eq_3d}")
+
+# Generate the 3D function
+print("   Generating 3D function...")
+func_3d = genFunc(eq_3d)
+print("   Function generated successfully!")
+
+# Create 3D test data
+rows, cols, depth = 4, 5, 3
+u3d_field = np.zeros(rows * cols * depth)
+result3d_field = np.zeros(rows * cols * depth)
+
+# Initialize with some pattern
+for i in range(rows):
+    for j in range(cols):
+        for k in range(depth):
+            idx = i * cols * depth + j * depth + k
+            u3d_field[idx] = float(i + j + k + 1)
+
+weight_val = 2.5
+
+print(f"   Grid size: {rows} x {cols} x {depth}")
+print(f"   Weight: {weight_val}")
+
+# Call the 3D function
+# Arguments: result_array, input_array, shape_params (rows, cols, depth), scalar_params
+func_3d(result3d_field, u3d_field, rows, cols, depth, weight_val)
+
+# Check results at a sample point
+sample_idx = 1 * cols * depth + 2 * depth + 1  # [1,2,1]
+print(f"   Sample point [1,2,1]:")
+print(f"   Input: {u3d_field[sample_idx]:.1f}")
+print(f"   Output: {result3d_field[sample_idx]:.1f}")
+print(f"   Expected: {weight_val * u3d_field[sample_idx]:.1f}")
+
+# Example 4: 1D compatibility (backward compatibility with v3)
+print(f"\n4. 1D Backward Compatibility Test")
 print("   Verifying that 1D equations still work")
 
 # 1D symbols
@@ -169,7 +209,8 @@ else:
 print(f"\n✓ Multi-dimensional examples completed successfully!")
 print(f"\nKey features demonstrated:")
 print(f"  • 2D heat diffusion with 5-point stencil")
-print(f"  • Multi-equation 2D gradient calculation")
-print(f"  • Automatic flattened array indexing")
+print(f"  • 2D Laplacian operator with stencil patterns")
+print(f"  • 3D array operations with flattened indexing")
+print(f"  • Automatic flattened array indexing (row-major)")
 print(f"  • Backward compatibility with 1D equations")
-print(f"  • Unified stencil bounds for multi-dimensional operations") 
+print(f"  • HPX parallel execution for multi-dimensional arrays") 

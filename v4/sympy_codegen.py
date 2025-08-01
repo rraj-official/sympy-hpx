@@ -161,57 +161,151 @@ class MultiDimCodeGenerator:
         else:
             return 0
     
-    def _generate_cpp_code(self, equations: List[sp.Eq], func_name: str) -> str:
-        """Generate C++ code for multi-dimensional equations."""
+    def _generate_cpp_code(self, equations: List[sp.Eq], func_name: str) -> Tuple[str, str]:
+        """Generate C++ code and CMakeLists.txt for multi-dimensional equations."""
         vector_vars, scalar_vars, result_vars, stencil_info, array_dims = self._analyze_equations(equations)
         
         # Determine if we have multi-dimensional arrays
         is_multidim = any(dim > 1 for dim in array_dims.values())
         max_dim = max(array_dims.values()) if array_dims else 1
-        
-        # Generate function signature
-        cpp_code = f"""#include <cmath>
 
-extern "C" {{
-
-void {func_name}("""
-        
+        # Build parameter list for C++ functions
+        params = []
         # Result parameters first
-        for i, var in enumerate(result_vars):
-            if i > 0:
-                cpp_code += ",\n               "
-            cpp_code += f"double* result_{var}"
+        for var in result_vars:
+            params.append(f"double* result_{var}")
+        # Input vector parameters  
+        for var in sorted(vector_vars):
+            params.append(f"const double* {var}")
         
-        # Input vector parameters
-        for var in vector_vars:
-            cpp_code += f",\n               const double* {var}"
-        
-        # Dimension parameters (if multi-dimensional)
+        # Dimension parameters
         if is_multidim:
             if max_dim >= 2:
-                cpp_code += ",\n               const int rows"
-                cpp_code += ",\n               const int cols"
+                params.append("int rows")
+                params.append("int cols")
             if max_dim >= 3:
-                cpp_code += ",\n               const int depth"
+                params.append("int depth")
         else:
-            cpp_code += ",\n               const int n"
-        
+            params.append("int n")
+            
         # Scalar parameters
-        for var in scalar_vars:
-            cpp_code += f",\n               const double {var}"
+        for var in sorted(scalar_vars):
+            params.append(f"const double {var}")
+        param_str = ", ".join(params)
+
+        # Build argument list for kernel call
+        arg_list = []
+        for var in result_vars:
+            arg_list.append(f"result_{var}")
+        for var in sorted(vector_vars):
+            arg_list.append(var)
         
-        cpp_code += ")\n{\n"
-        
-        # Generate loop structure based on dimensionality
-        if is_multidim and max_dim > 1:
-            cpp_code += self._generate_multidim_loops(equations, vector_vars, scalar_vars, result_vars, 
-                                                    stencil_info, array_dims, max_dim)
+        if is_multidim:
+            if max_dim >= 2:
+                arg_list.extend(["rows", "cols"])
+            if max_dim >= 3:
+                arg_list.append("depth")
         else:
-            cpp_code += self._generate_1d_loops(equations, vector_vars, scalar_vars, result_vars, stencil_info)
+            arg_list.append("n")
+            
+        arg_list.extend(sorted(scalar_vars))
+        arg_list_str = ", ".join(arg_list)
+
+        # Generate equation assignments for the parallel loop
+        if is_multidim and max_dim > 1:
+            equation_code = self._generate_multidim_equations(equations, vector_vars, scalar_vars, result_vars, array_dims, max_dim)
+            if max_dim == 2:
+                total_size = "rows * cols"
+                loop_body = f"""
+        const int total_size = {total_size};
+        hpx::experimental::for_loop(hpx::execution::par, 0, total_size, [=](std::size_t idx) {{
+            const int i = idx / cols;
+            const int j = idx % cols;
+{equation_code}        }});"""
+            elif max_dim == 3:
+                total_size = "rows * cols * depth"
+                loop_body = f"""
+        const int total_size = {total_size};
+        hpx::experimental::for_loop(hpx::execution::par, 0, total_size, [=](std::size_t idx) {{
+            const int i = idx / (cols * depth);
+            const int j = (idx / depth) % cols;
+            const int k = idx % depth;
+{equation_code}        }});"""
+        else:
+            # 1D case
+            equation_code = self._generate_1d_equations(equations, vector_vars, scalar_vars, result_vars)
+            loop_body = f"""
+        hpx::experimental::for_loop(hpx::execution::par, 0, n, [=](std::size_t i) {{
+{equation_code}        }});"""
+
+        cpp_code = f"""
+#include <hpx/init.hpp>
+#include <hpx/hpx_start.hpp>
+#include <hpx/algorithm.hpp>
+#include <hpx/execution.hpp>
+#include <cmath>
+
+int hpx_kernel({param_str})
+{{
+    // Multi-dimensional HPX parallel execution{loop_body}
+    return hpx::finalize();
+}}
+
+extern "C" void {func_name}({param_str})
+{{
+    int argc = 0;
+    char *argv[] = {{ nullptr }};
+    hpx::start(nullptr, argc, argv);
+    hpx::run_as_hpx_thread([&]() {{
+        return hpx_kernel({arg_list_str});
+    }});
+    hpx::stop();
+}}
+"""
+
+        cmake_code = f"""
+cmake_minimum_required(VERSION 3.18)
+project(sympy_hpx_multidim LANGUAGES CXX)
+
+find_package(HPX REQUIRED)
+add_library({func_name} SHARED kernel.cpp)
+target_link_libraries({func_name} PRIVATE HPX::hpx)
+"""
         
-        cpp_code += "}\n\n}"
+        return cpp_code, cmake_code
+    
+    def _generate_1d_equations(self, equations: List[sp.Eq], vector_vars: List[str], scalar_vars: List[str], result_vars: List[str]) -> str:
+        """Generate 1D equation assignments for HPX parallel loop."""
+        equation_code = ""
+        for eq in equations:
+            lhs = eq.lhs
+            rhs = eq.rhs
+            result_var = str(lhs.base)
+            
+            # Convert expression to C++ code
+            rhs_str = self._convert_1d_expression_to_cpp(rhs, vector_vars, scalar_vars, result_vars)
+            equation_code += f"            result_{result_var}[i] = {rhs_str};\n"
         
-        return cpp_code
+        return equation_code
+    
+    def _generate_multidim_equations(self, equations: List[sp.Eq], vector_vars: List[str], scalar_vars: List[str], 
+                                   result_vars: List[str], array_dims: Dict[str, int], max_dim: int) -> str:
+        """Generate multi-dimensional equation assignments for HPX parallel loop."""
+        equation_code = ""
+        for eq in equations:
+            lhs = eq.lhs
+            rhs = eq.rhs
+            result_var = str(lhs.base)
+            
+            # Convert expression to C++ code
+            if max_dim == 2:
+                rhs_str = self._convert_2d_expression_to_cpp(rhs, vector_vars, scalar_vars, result_vars, array_dims)
+                equation_code += f"            result_{result_var}[i * cols + j] = {rhs_str};\n"
+            elif max_dim == 3:
+                rhs_str = self._convert_3d_expression_to_cpp(rhs, vector_vars, scalar_vars, result_vars, array_dims)
+                equation_code += f"            result_{result_var}[i * cols * depth + j * depth + k] = {rhs_str};\n"
+        
+        return equation_code
     
     def _generate_1d_loops(self, equations: List[sp.Eq], vector_vars: List[str], scalar_vars: List[str],
                           result_vars: List[str], stencil_info: MultiDimStencilInfo) -> str:
@@ -481,37 +575,44 @@ void {func_name}("""
         
         return expr_str
     
-    def _compile_cpp_code(self, cpp_code: str, func_name: str) -> str:
-        """Compile the C++ code into a shared library and return the path."""
-        code_hash = hashlib.md5(cpp_code.encode()).hexdigest()[:8]
-        cpp_file = f"generated_{func_name}_{code_hash}.cpp"
-        so_file = f"generated_{func_name}_{code_hash}.so"
+    def _compile_cpp_code(self, cpp_code_pair: Tuple[str, str], func_name: str) -> str:
+        """
+        Compile the C++ code into a shared library using CMake.
+        """
+        cpp_code, cmake_code = cpp_code_pair
         
-        # Write C++ code to local file
-        with open(cpp_file, 'w') as f:
+        # Create build directory inside tmp folder
+        tmp_dir = "tmp"
+        if not os.path.exists(tmp_dir):
+            os.makedirs(tmp_dir)
+        
+        build_dir = os.path.join(tmp_dir, f"build_{func_name}")
+        if not os.path.exists(build_dir):
+            os.makedirs(build_dir)
+        
+        with open(os.path.join(build_dir, "kernel.cpp"), "w") as f:
             f.write(cpp_code)
+        with open(os.path.join(build_dir, "CMakeLists.txt"), "w") as f:
+            f.write(cmake_code)
             
-        print(f"Generated C++ code saved to: {cpp_file}")
+        print(f"Building HPX multi-dimensional kernel in {build_dir}...")
         
-        # Track files for cleanup
-        _generated_files.add(cpp_file)
-        _generated_files.add(so_file)
-            
-        # Compile to shared library
-        compile_cmd = [
-            "g++", "-shared", "-fPIC", "-O3", "-std=c++17",
-            cpp_file, "-o", so_file
-        ]
+        cmake_cmd = ["cmake", f"-DHPX_DIR={os.environ.get('HOME')}/hpx-install-system/lib/cmake/HPX", "."]
         
         try:
-            result = subprocess.run(compile_cmd, check=True, capture_output=True, text=True)
-            print(f"Compilation successful for: {so_file}")
+            subprocess.run(cmake_cmd, cwd=build_dir, check=True, capture_output=True, text=True)
+            subprocess.run(["make", "-j"], cwd=build_dir, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as e:
-            print(f"Compilation command: {' '.join(compile_cmd)}")
-            print(f"Compilation stderr: {e.stderr}")
-            print(f"Compilation stdout: {e.stdout}")
-            raise RuntimeError(f"Compilation failed: {e.stderr}")
-            
+            print(f"CMake or Make failed for {func_name}:")
+            print(f"  CMake command: {' '.join(e.cmd)}")
+            print(f"  CMake stderr: {e.stderr}")
+            raise
+
+        so_file = os.path.join(build_dir, f"lib{func_name}.so")
+        if not os.path.exists(so_file):
+             so_file = os.path.join(build_dir, f"{func_name}.so") # Fallback name
+
+        _generated_files.add(build_dir)
         return so_file
     
     def _create_python_wrapper(self, so_file: str, func_name: str, equations: List[sp.Eq]):
@@ -800,8 +901,8 @@ def genFunc(equations: Union[sp.Eq, List[sp.Eq]]) -> callable:
     func_name = f"cpp_multidim_{func_hash}"
     
     # Generate and compile C++ code
-    cpp_code = generator._generate_cpp_code(equations, func_name)
-    so_file = generator._compile_cpp_code(cpp_code, func_name)
+    cpp_code_pair = generator._generate_cpp_code(equations, func_name)
+    so_file = generator._compile_cpp_code(cpp_code_pair, func_name)
     
     # Create Python wrapper
     wrapper = generator._create_python_wrapper(so_file, func_name, equations)
