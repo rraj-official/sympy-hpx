@@ -5,11 +5,35 @@ Generates C++ functions from SymPy expressions and compiles them into callable P
 
 import os
 import subprocess
-import tempfile
 import hashlib
+import atexit
+import weakref
 from typing import Dict, List, Tuple, Any
 import sympy as sp
 import numpy as np
+
+
+# Global set to track generated files for cleanup
+_generated_files = set()
+
+
+def _cleanup_generated_files():
+    """Cleanup function to remove generated files on exit."""
+    for file_path in _generated_files.copy():
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                _generated_files.discard(file_path)
+            elif os.path.isdir(file_path): # Also remove build directories
+                import shutil
+                shutil.rmtree(file_path)
+                _generated_files.discard(file_path)
+        except OSError:
+            pass  # File might already be deleted
+
+
+# Register cleanup function to run on exit
+atexit.register(_cleanup_generated_files)
 
 
 class SymPyCodeGenerator:
@@ -18,7 +42,6 @@ class SymPyCodeGenerator:
     """
     
     def __init__(self):
-        self.temp_dir = tempfile.mkdtemp()
         self.compiled_functions = {}
         
     def _analyze_expression(self, eq: sp.Eq) -> Tuple[List[str], List[str], str]:
@@ -76,116 +99,133 @@ class SymPyCodeGenerator:
         
         return vector_vars, scalar_vars, result_var
     
-    def _generate_cpp_code(self, eq: sp.Eq, func_name: str) -> str:
+    def _generate_cpp_code(self, eq: sp.Eq, func_name: str) -> Tuple[str, str]:
         """
-        Generate C++ code for the given SymPy equation.
+        Generate C++ code and CMakeLists.txt for the given SymPy equation.
         """
         vector_vars, scalar_vars, result_var = self._analyze_expression(eq)
-        
-        # Generate function signature
-        cpp_code = f"""#include <vector>
-#include <cassert>
+
+        # Build parameter list for C++ functions
+        params = [f"double* {result_var}"]
+        for var in sorted(vector_vars):
+            if var != result_var:
+                params.append(f"const double* {var}")
+        params.append("int n")
+        for var in sorted(scalar_vars):
+            params.append(f"const double {var}")
+        param_str = ", ".join(params)
+
+        # Build argument list for kernel call
+        arg_list = [result_var]
+        for var in sorted(vector_vars):
+            if var != result_var:
+                arg_list.append(var)
+        arg_list.append("n")
+        arg_list.extend(sorted(scalar_vars))
+        arg_list_str = ", ".join(arg_list)
+
+        # Convert SymPy expression to C++
+        rhs = self._convert_expression_to_cpp(eq.rhs, vector_vars, scalar_vars, result_var)
+
+        cpp_code = f"""
+#include <hpx/init.hpp>
+#include <hpx/hpx_start.hpp>
+#include <hpx/algorithm.hpp>
+#include <hpx/execution.hpp>
 #include <cmath>
 
-extern "C" {{
+int hpx_kernel({param_str})
+{{
+    hpx::experimental::for_loop(hpx::execution::par, 0, n, [=](std::size_t i) {{
+        {result_var}[i] = {rhs};
+    }});
+    return hpx::finalize();
+}}
 
-void {func_name}("""
-        
-        # Add result parameter first
-        cpp_code += f"std::vector<double>& v{result_var}"
-        
-        # Add vector parameters (alphabetically ordered)
-        for var in vector_vars:
-            if var != result_var:  # Don't duplicate result variable
-                cpp_code += f",\n               const std::vector<double>& v{var}"
-        
-        # Add scalar parameters (alphabetically ordered) 
-        for var in scalar_vars:
-            cpp_code += f",\n               const double& s{var}"
-            
-        cpp_code += ")\n{\n"
-        
-        # Add size assertions
-        if vector_vars:
-            first_vector = vector_vars[0] if vector_vars[0] != result_var else (vector_vars[1] if len(vector_vars) > 1 else None)
-            if first_vector:
-                cpp_code += f"    const int n = v{first_vector}.size();\n"
-                
-                # Add assertions for all vectors
-                for var in vector_vars:
-                    if var != first_vector:
-                        cpp_code += f"    assert(n == v{var}.size());\n"
-                        
-                if result_var not in vector_vars:
-                    cpp_code += f"    assert(n == v{result_var}.size());\n"
-        
-        # Generate the loop body
-        cpp_code += "\n    // Generated loop\n"
-        cpp_code += "    for(int i = 0; i < n; i++) {\n"
-        
-        # Convert SymPy expression to C++ code
-        rhs = eq.rhs
-        rhs_str = str(rhs)
-        
-        # Replace indexed variables with C++ array access
-        # First, replace indexed expressions like a[i] with va[i]
-        for var in vector_vars:
-            if var != result_var:  # Don't replace result variable in RHS
-                rhs_str = rhs_str.replace(f"{var}[i]", f"v{var}[i]")
-        
-        # Then replace scalar variables with their parameter names
-        for var in scalar_vars:
-            rhs_str = rhs_str.replace(var, f"s{var}")
-            
-        # Convert Python operators to C++ equivalents
-        # Handle power operator ** -> pow()
+extern "C" void {func_name}({param_str})
+{{
+    int argc = 0;
+    char *argv[] = {{ nullptr }};
+    hpx::start(nullptr, argc, argv);
+    hpx::run_as_hpx_thread([&]() {{
+        return hpx_kernel({arg_list_str});
+    }});
+    hpx::post([](){{ hpx::finalize(); }});
+    hpx::stop();
+}}
+"""
+
+        cmake_code = f"""
+cmake_minimum_required(VERSION 3.18)
+project(sympy_hpx_kernel LANGUAGES CXX)
+
+find_package(HPX REQUIRED)
+add_library({func_name} SHARED kernel.cpp)
+target_link_libraries({func_name} PRIVATE HPX::hpx)
+"""
+        return cpp_code, cmake_code
+
+    def _convert_expression_to_cpp(self, expr, vector_vars, scalar_vars, result_var):
+        """Converts a SymPy expression to a C++ string."""
         import re
-        # Replace patterns like "va[i]**2" with "pow(va[i], 2)"
+        expr_str = str(expr)
+        
+        indexed_pattern = r'(\w+)\[([^\]]+)\]'
+        def replace_indexed(match):
+            var_name = match.group(1)
+            index_expr = match.group(2)
+            if var_name in vector_vars or var_name == result_var:
+                 return f"{var_name}[{index_expr}]"
+            return match.group(0)
+        expr_str = re.sub(indexed_pattern, replace_indexed, expr_str)
+
+        for var in scalar_vars:
+            expr_str = re.sub(r'\b' + re.escape(var) + r'\b', var, expr_str)
+            
         power_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*\[[^\]]+\]|\([^)]+\)|\w+)\*\*(\d+(?:\.\d+)?|\([^)]+\)|\w+)'
         def power_replacement(match):
-            base = match.group(1)
-            exponent = match.group(2)
+            base, exponent = match.groups()
             return f"pow({base}, {exponent})"
-        
-        rhs_str = re.sub(power_pattern, power_replacement, rhs_str)
-            
-        cpp_code += f"        v{result_var}[i] = {rhs_str};\n"
-        cpp_code += "    }\n"
-        cpp_code += "}\n\n}"
-        
-        return cpp_code
-    
-    def _compile_cpp_code(self, cpp_code: str, func_name: str) -> str:
+        return re.sub(power_pattern, power_replacement, expr_str)
+
+    def _compile_cpp_code(self, cpp_code_pair: Tuple[str, str], func_name: str) -> str:
         """
-        Compile the C++ code into a shared library and return the path.
+        Compile the C++ code into a shared library using CMake.
         """
-        # Create unique filename based on code hash
-        code_hash = hashlib.md5(cpp_code.encode()).hexdigest()[:8]
-        cpp_file = os.path.join(self.temp_dir, f"{func_name}_{code_hash}.cpp")
-        so_file = os.path.join(self.temp_dir, f"{func_name}_{code_hash}.so")
+        cpp_code, cmake_code = cpp_code_pair
         
-        # Also save to current directory for inspection
-        local_cpp_file = f"generated_{func_name}.cpp"
+        # Create build directory inside tmp folder
+        tmp_dir = "tmp"
+        if not os.path.exists(tmp_dir):
+            os.makedirs(tmp_dir)
         
-        # Write C++ code to both temp and local files
-        with open(cpp_file, 'w') as f:
+        build_dir = os.path.join(tmp_dir, f"build_{func_name}")
+        if not os.path.exists(build_dir):
+            os.makedirs(build_dir)
+        
+        with open(os.path.join(build_dir, "kernel.cpp"), "w") as f:
             f.write(cpp_code)
-        with open(local_cpp_file, 'w') as f:
-            f.write(cpp_code)
+        with open(os.path.join(build_dir, "CMakeLists.txt"), "w") as f:
+            f.write(cmake_code)
             
-        print(f"Generated C++ code saved to: {local_cpp_file}")
-            
-        # Compile to shared library
-        compile_cmd = [
-            "g++", "-shared", "-fPIC", "-O3", "-std=c++17",
-            cpp_file, "-o", so_file
-        ]
+        print(f"Building HPX kernel in {build_dir}...")
+        
+        cmake_cmd = ["cmake", f"-DHPX_DIR={os.environ.get('HOME')}/hpx-install-system/lib/cmake/HPX", "."]
         
         try:
-            subprocess.run(compile_cmd, check=True, capture_output=True, text=True)
+            subprocess.run(cmake_cmd, cwd=build_dir, check=True, capture_output=True, text=True)
+            subprocess.run(["make", "-j"], cwd=build_dir, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Compilation failed: {e.stderr}")
-            
+            print(f"CMake or Make failed for {func_name}:")
+            print(f"  CMake command: {' '.join(e.cmd)}")
+            print(f"  CMake stderr: {e.stderr}")
+            raise
+
+        so_file = os.path.join(build_dir, f"lib{func_name}.so")
+        if not os.path.exists(so_file):
+             so_file = os.path.join(build_dir, f"{func_name}.so") # Fallback name
+
+        _generated_files.add(build_dir)
         return so_file
     
     def _create_python_wrapper(self, so_file: str, func_name: str, eq: sp.Eq):
@@ -193,116 +233,157 @@ void {func_name}("""
         Create a Python wrapper function that calls the compiled C++ function.
         """
         import ctypes
+        from ctypes import POINTER, c_double, c_int
         
-        # Load the shared library
-        lib = ctypes.CDLL(so_file)
+        # Load the shared library (use absolute path)
+        abs_so_file = os.path.abspath(so_file)
+        lib = ctypes.CDLL(abs_so_file)
         
         # Get function signature info
         vector_vars, scalar_vars, result_var = self._analyze_expression(eq)
         
-        def wrapper(*args):
+        # Define ctypes structures for std::vector<double>
+        class StdVector(ctypes.Structure):
+            _fields_ = [("data", POINTER(c_double)),
+                       ("size", c_int),
+                       ("capacity", c_int)]
+        
+        def wrapper(*args, **kwargs):
             """
             Python wrapper for the compiled C++ function.
-            Arguments should be provided in the order: result_vector, vector_args..., scalar_args...
+            Can be called with positional or keyword arguments.
+            Expected keywords: result_var, vector_vars (excluding result), scalar_vars
             """
-            if len(args) != 1 + len(vector_vars) - (1 if result_var in vector_vars else 0) + len(scalar_vars):
-                expected = 1 + len(vector_vars) - (1 if result_var in vector_vars else 0) + len(scalar_vars)
-                raise ValueError(f"Expected {expected} arguments, got {len(args)}")
-            
-            # Convert numpy arrays to ctypes
-            c_vectors = []
-            arg_idx = 0
-            
-            # Result vector (first argument)
-            result_array = np.asarray(args[arg_idx], dtype=np.float64)
-            arg_idx += 1
-            
-            # Vector arguments (excluding result if it's also in vector_vars)
-            vector_args = []
-            for var in vector_vars:
-                if var != result_var:
-                    vec_array = np.asarray(args[arg_idx], dtype=np.float64)
-                    vector_args.append(vec_array)
+            if kwargs:
+                # Handle keyword arguments
+                result_array = np.asarray(kwargs[result_var], dtype=np.float64)
+                
+                # Vector arguments (excluding result if it's also in vector_vars)
+                vector_args = []
+                for var in sorted(vector_vars):
+                    if var != result_var:
+                        vec_array = np.asarray(kwargs[var], dtype=np.float64)
+                        vector_args.append(vec_array)
+                
+                # Scalar arguments
+                scalar_args = []
+                for var in sorted(scalar_vars):
+                    scalar_args.append(float(kwargs[var]))
+                    
+            else:
+                # Handle positional arguments (existing logic)
+                if len(args) != 1 + len(vector_vars) - (1 if result_var in vector_vars else 0) + len(scalar_vars):
+                    expected = 1 + len(vector_vars) - (1 if result_var in vector_vars else 0) + len(scalar_vars)
+                    raise ValueError(f"Expected {{expected}} arguments, got {{len(args)}}")
+                
+                arg_idx = 0
+                
+                # Result vector (first argument)
+                result_array = np.asarray(args[arg_idx], dtype=np.float64)
+                arg_idx += 1
+                
+                # Vector arguments (excluding result if it's also in vector_vars)
+                vector_args = []
+                for var in sorted(vector_vars):
+                    if var != result_var:
+                        vec_array = np.asarray(args[arg_idx], dtype=np.float64)
+                        vector_args.append(vec_array)
+                        arg_idx += 1
+                
+                # Scalar arguments
+                scalar_args = []
+                for var in sorted(scalar_vars):
+                    scalar_args.append(float(args[arg_idx]))
                     arg_idx += 1
             
-            # Scalar arguments
-            scalar_args = []
-            for var in scalar_vars:
-                scalar_args.append(float(args[arg_idx]))
-                arg_idx += 1
-            
-            # Set up ctypes function signature
-            lib_func = getattr(lib, func_name)
-            
-            # Call the C++ function
-            # Note: This is a simplified version. In a full implementation,
-            # you'd need to properly set up ctypes argument and return types
-            # For now, we'll use a direct approach with numpy arrays
-            
-            # Get the size
+            # Get the size and verify all vectors have the same size
             n = len(result_array)
-            
-            # Verify all vectors have the same size
             for vec in vector_args:
                 if len(vec) != n:
                     raise ValueError("All vectors must have the same size")
             
-            # Simple direct computation (bypassing ctypes for this example)
-            # In a full implementation, you'd call the compiled C++ function
-            self._compute_directly(eq, result_array, vector_args, scalar_args, vector_vars, scalar_vars, result_var)
+            # Call the compiled C++ function using a simpler approach
+            # Since we're using extern "C" and basic types, we can call directly
+            try:
+                # Get the C function
+                c_func = getattr(lib, func_name)
+                
+                # Convert numpy arrays to ctypes pointers
+                result_ptr = result_array.ctypes.data_as(POINTER(c_double))
+                vector_ptrs = [vec.ctypes.data_as(POINTER(c_double)) for vec in vector_args]
+                
+                # Set up argument types for the C function
+                argtypes = [POINTER(c_double)]  # result vector
+                for _ in vector_args:
+                    argtypes.append(POINTER(c_double))  # input vectors
+                for _ in scalar_args:
+                    argtypes.append(c_double)  # scalar arguments
+                argtypes.append(c_int)  # size parameter
+                
+                c_func.argtypes = argtypes
+                c_func.restype = None
+                
+                # Call the C++ function
+                call_args = [result_ptr] + vector_ptrs + scalar_args + [n]
+                c_func(*call_args)
+                
+            except Exception as e:
+                print(f"Failed to call C++ function: {{e}}")
+                print("Falling back to Python computation...")
+                # Fallback to Python computation
+                self._compute_directly(eq, result_array, vector_args, scalar_args, vector_vars, scalar_vars, result_var)
             
         return wrapper
     
     def _compute_directly(self, eq: sp.Eq, result_array, vector_args, scalar_args, vector_vars, scalar_vars, result_var):
         """
-        Direct computation fallback (for demonstration purposes).
-        In a full implementation, this would call the compiled C++ function.
+        Direct computation of the equation using SymPy evaluation.
         """
         n = len(result_array)
         
         # Create symbol mapping
         symbol_map = {}
         
-        # Map vector variables
-        vec_idx = 0
+        # Map vector variables to their arrays
+        vector_idx = 0
         for var in vector_vars:
             if var != result_var:
-                symbol_map[var] = vector_args[vec_idx]
-                vec_idx += 1
+                symbol_map[var] = vector_args[vector_idx]
+                vector_idx += 1
         
-        # Map scalar variables
+        # Map scalar variables to their values
         for i, var in enumerate(scalar_vars):
             symbol_map[var] = scalar_args[i]
         
-        # Evaluate the expression for each index
-        rhs = eq.rhs
+        # Evaluate the equation for each index
         for i in range(n):
-            # Substitute indexed variables
-            expr_subs = rhs
-            for var, values in symbol_map.items():
-                if isinstance(values, np.ndarray):
-                    # Replace indexed access
-                    var_indexed = sp.Symbol(f"{var}[i]")  # This is simplified
-                    # In practice, you'd need more sophisticated substitution
-                else:
-                    # Scalar substitution
-                    expr_subs = expr_subs.subs(sp.Symbol(var), values)
-            
-            # For this example, let's handle the specific case mentioned in requirements
-            # r[i] = d*a[i] + b[i]*c[i]
-            if len(vector_args) >= 3 and len(scalar_args) >= 1:
-                a_val = vector_args[0][i] if len(vector_args) > 0 else 0
-                b_val = vector_args[1][i] if len(vector_args) > 1 else 0  
-                c_val = vector_args[2][i] if len(vector_args) > 2 else 0
-                d_val = scalar_args[0] if len(scalar_args) > 0 else 1
+            try:
+                # Get the right-hand side of the equation
+                rhs = eq.rhs
                 
-                result_array[i] = d_val * a_val + b_val * c_val
-            else:
+                # Substitute indexed expressions
+                expr_subs = rhs
+                indexed_exprs = list(rhs.atoms(sp.Indexed))
+                for indexed_expr in indexed_exprs:
+                    base_name = str(indexed_expr.base)
+                    if base_name in symbol_map and isinstance(symbol_map[base_name], np.ndarray):
+                        # For now, assume simple index i
+                        value = symbol_map[base_name][i]
+                        expr_subs = expr_subs.subs(indexed_expr, value)
+                
+                # Substitute scalar variables
+                for var, value in symbol_map.items():
+                    if not isinstance(value, np.ndarray):
+                        expr_subs = expr_subs.subs(sp.Symbol(var), value)
+                
                 # Fallback: try to evaluate symbolically
                 try:
                     result_array[i] = float(expr_subs.evalf())
                 except:
                     result_array[i] = 0.0
+            except Exception:
+                # If evaluation fails, set to 0.0
+                result_array[i] = 0.0
 
 
 def genFunc(equation: sp.Eq) -> callable:
@@ -323,8 +404,8 @@ def genFunc(equation: sp.Eq) -> callable:
     func_name = f"cpp_func_{func_hash}"
     
     # Generate and compile C++ code
-    cpp_code = generator._generate_cpp_code(equation, func_name)
-    so_file = generator._compile_cpp_code(cpp_code, func_name)
+    cpp_code_pair = generator._generate_cpp_code(equation, func_name)
+    so_file = generator._compile_cpp_code(cpp_code_pair, func_name)
     
     # Create Python wrapper
     wrapper = generator._create_python_wrapper(so_file, func_name, equation)
