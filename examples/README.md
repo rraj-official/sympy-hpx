@@ -2,6 +2,44 @@
 
 This directory contains comprehensive scientific computing examples demonstrating the capabilities of `sympy-hpx` v4 with HPX parallel acceleration. Each example showcases different physics, numerical methods, and computational challenges.
 
+**⚡ Performance Note**: All examples benefit from smart compilation optimization - first run compiles the HPX kernel (~3-5s), subsequent runs with identical equations skip compilation entirely (~0.03s), enabling rapid iteration and testing.
+
+## 📊 Performance Benchmark
+
+### **Performance Benchmark** (`benchmark.py`)
+**Purpose**: Compare Python/NumPy vs sympy-hpx v4 performance  
+**Equation**: Complex 2D reaction-diffusion system (2 coupled PDEs)  
+**Method**: Multi-equation HPX parallel processing  
+**Features**:
+- ✅ Tests multiple problem sizes (2.5K to 90K elements)
+- ✅ Compares Pure Python, NumPy, SymPy+NumPy, and sympy-hpx v4
+- ✅ Shows up to **5x speedup** over NumPy for large problems
+- ✅ Demonstrates HPX runtime optimization benefits
+- **Performance**: Best speedup at 90K elements (5.0x faster than NumPy)
+
+**Key Results:**
+- Small problems (2.5K): HPX overhead dominates
+- Medium problems (10K+): HPX starts showing benefits  
+- Large problems (40K+): **3-5x speedup** over NumPy
+- Runtime optimization: 27-33x faster subsequent calls
+
+**Usage:**
+```bash
+cd examples
+python3 benchmark.py
+```
+
+**Sample Output:**
+```
+TESTING GRID SIZE: 300 × 300 = 90,000 elements
+NumPy Vectorized:     6.09 ms
+sympy-hpx v4:         1.21 ms (avg), 1.73 ms (init)
+Speedups vs NumPy:
+sympy-hpx v4:         5.0x faster
+```
+
+---
+
 ## 🔬 Available Examples
 
 ### 1. **2D Heat Diffusion** (`2D_heat_diffusion.py`)

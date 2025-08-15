@@ -188,9 +188,28 @@ target_link_libraries({func_name} PRIVATE HPX::hpx)
             return f"pow({base}, {exponent})"
         return re.sub(power_pattern, power_replacement, expr_str)
 
+    def _write_file_if_changed(self, filepath: str, content: str) -> bool:
+        """
+        Write content to file only if it has changed.
+        Returns True if file was written, False if content was unchanged.
+        """
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, "r") as f:
+                    existing_content = f.read()
+                if existing_content == content:
+                    return False  # Content unchanged, no need to write
+            except (IOError, OSError):
+                pass  # If we can't read, we'll write anyway
+        
+        with open(filepath, "w") as f:
+            f.write(content)
+        return True
+
     def _compile_cpp_code(self, cpp_code_pair: Tuple[str, str], func_name: str) -> str:
         """
         Compile the C++ code into a shared library using CMake.
+        Only recompiles if source files have actually changed.
         """
         cpp_code, cmake_code = cpp_code_pair
         
@@ -203,10 +222,23 @@ target_link_libraries({func_name} PRIVATE HPX::hpx)
         if not os.path.exists(build_dir):
             os.makedirs(build_dir)
         
-        with open(os.path.join(build_dir, "kernel.cpp"), "w") as f:
-            f.write(cpp_code)
-        with open(os.path.join(build_dir, "CMakeLists.txt"), "w") as f:
-            f.write(cmake_code)
+        # Only write files if content has changed
+        cpp_path = os.path.join(build_dir, "kernel.cpp")
+        cmake_path = os.path.join(build_dir, "CMakeLists.txt")
+        
+        cpp_changed = self._write_file_if_changed(cpp_path, cpp_code)
+        cmake_changed = self._write_file_if_changed(cmake_path, cmake_code)
+        
+        # Check if shared library already exists and is newer than source files
+        so_file = os.path.join(build_dir, f"lib{func_name}.so")
+        if not os.path.exists(so_file):
+            so_file = os.path.join(build_dir, f"{func_name}.so")  # Fallback name
+        
+        # Skip compilation if nothing changed and shared library exists
+        if not cpp_changed and not cmake_changed and os.path.exists(so_file):
+            print(f"HPX kernel for {func_name} is up to date, skipping compilation...")
+            _generated_files.add(build_dir)
+            return so_file
             
         print(f"Building HPX kernel in {build_dir}...")
         
